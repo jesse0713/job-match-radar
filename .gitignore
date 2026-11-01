@@ -1,0 +1,29 @@
+# 凭据与本地配置（绝不入库）
+.env
+.env.*
+!.env.example
+
+# 运行时数据
+jobs.db
+jobs.db-*
+logs/
+outbox/
+chrome-profile/
+*.eml
+preview.*
+
+# 个人材料
+resume_text.txt
+*.docx
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
