@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>正在打开 APP…</title>
+<style>
+  :root { --blue:#1a56db; --ink:#152238; --muted:#6b7787; --line:#e6ebf2; --bg:#f2f4f7; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif; }
+  .wrap { max-width:420px; margin:0 auto; padding:28px 18px 40px; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:16px;
+          padding:22px 20px; box-shadow:0 6px 24px rgba(21,34,56,.06); }
+  .badge { display:inline-block; font-size:11px; color:var(--blue); background:#eaf1ff;
+           border-radius:999px; padding:4px 9px; margin-bottom:12px; }
+  h1 { font-size:19px; line-height:1.45; margin:0 0 8px; }
+  .sub { font-size:13px; color:var(--muted); line-height:1.7; margin:0 0 18px; }
+  .job { font-size:13px; background:#f7f9fc; border-radius:10px; padding:10px 12px;
+         line-height:1.6; margin:0 0 16px; }
+  .btn { display:block; text-align:center; text-decoration:none; border-radius:10px;
+         padding:14px 16px; font-size:16px; font-weight:700; margin:10px 0; }
+  .primary { background:var(--blue); color:#fff; }
+  .secondary { background:#f7faff; color:var(--blue); border:1px solid #cfe0ff; }
+  .tip { font-size:12px; color:#8a94a6; line-height:1.75; margin-top:16px; }
+  .hide { display:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="badge" id="source">岗位雷达</div>
+    <h1 id="title">正在打开 APP…</h1>
+    <p class="sub" id="hint">如果已安装 APP，会自动跳到岗位页。</p>
+    <div class="job hide" id="job"></div>
+    <a class="btn primary" id="openApp" href="#">打开 APP 看 JD</a>
+    <a class="btn secondary" id="openWeb" href="#">手机网页版</a>
+    <p class="tip">
+      按钮没反应？<br>
+      iPhone：点右上角「…」→「在 Safari 中打开」，再点上面的按钮。<br>
+      Android：点右上角「…」→「在浏览器打开」，再点上面的按钮。
+    </p>
+  </div>
+</div>
+<script>
+(function () {
+  var q = new URLSearchParams(window.location.search);
+  var source = (q.get('s') || '').toLowerCase();
+  var id = (q.get('id') || '').trim();
+  var kind = (q.get('k') || '').trim();
+  var web = (q.get('u') || '').trim();
+  var title = (q.get('t') || '').trim();
+
+  var isBoss = source === 'boss' && /^[A-Za-z0-9_-]{6,64}$/.test(id);
+  var isLiepin = source === 'liepin' && /^\d{1,20}$/.test(id);
+  var sourceName = isBoss ? 'BOSS直聘' : (isLiepin ? '猎聘' : '招聘 APP');
+  var $ = function (x) { return document.getElementById(x); };
+
+  // 只允许官方手机站，避免被拿来做开放跳转
+  if (web && !/^https:\/\/m\.(zhipin|liepin)\.com\//i.test(web)) web = '';
+  if (!web) {
+    if (isBoss) web = 'https://m.zhipin.com/job_detail/' + id + '.html';
+    else if (isLiepin) web = 'https://m.liepin.com/job/' + id + '.shtml';
+  }
+
+  var deep = '';
+  if (isBoss) {
+    deep = 'bosszp://bosszhipin.app/openwith?type=newwebview&fullScreen=1&url=' + encodeURIComponent(web);
+  } else if (isLiepin) {
+    deep = 'liepin://www.liepin.com/job/job_detail?role=c&jobId=' + encodeURIComponent(id);
+    if (/^\d{1,2}$/.test(kind)) deep += '&jobKind=' + encodeURIComponent(kind);
+  }
+
+  $('source').textContent = sourceName;
+  if (title) {
+    $('job').textContent = title;
+    $('job').className = 'job';
+  }
+  if (!deep) {
+    $('title').textContent = '链接参数不完整';
+    $('hint').textContent = '请回到邮件重新点击岗位链接。';
+    $('openApp').className = 'btn primary hide';
+    $('openWeb').className = 'btn secondary hide';
+    return;
+  }
+
+  $('title').textContent = '正在打开 ' + sourceName + '…';
+  $('openApp').href = deep;
+  $('openWeb').href = web;
+  $('openApp').textContent = '打开 ' + sourceName + ' APP 看 JD';
+
+  var left = false;
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) left = true;
+  });
+  window.addEventListener('pagehide', function () { left = true; });
+  window.addEventListener('blur', function () { left = true; });
+
+  // iOS 上无手势的自定义 scheme 跳转容易被拦，直接让用户点按钮；
+  // Android 先自动试一次，失败后页面仍在，可手动点。
+  var isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+  if (isIOS) {
+    $('hint').textContent = '点下面的按钮，直接打开 ' + sourceName + ' APP';
+  } else {
+    setTimeout(function () {
+      if (left) return;
+      try { window.location.href = deep; } catch (e) {}
+    }, 350);
+  }
+
+  setTimeout(function () {
+    if (left) return;
+    $('hint').textContent = '没有自动打开？点下面的按钮；如果仍没反应，请按底部提示在浏览器中打开。';
+  }, 1600);
+})();
+</script>
+</body>
+</html>
