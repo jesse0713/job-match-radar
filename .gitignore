@@ -6,6 +6,8 @@
 # 运行时数据
 jobs.db
 jobs.db-*
+jobs-*.db
+jobs-*.db-*
 logs/
 outbox/
 chrome-profile/
@@ -15,6 +17,14 @@ preview.*
 # 个人材料
 resume_text.txt
 *.docx
+# 含真实履历的简历生成脚本，只留在本地
+build_legal_resume.py
+
+# 临时调试 / 探测脚本
+_api*.py
+_c2.py
+_cookie_check.py
+probe_deeplink.py
 
 # Python 缓存
 __pycache__/
@@ -27,3 +37,7 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 本地 gh-pages 工作树与 pip 临时目录
+.smartlink-worktree/
+pip-*/

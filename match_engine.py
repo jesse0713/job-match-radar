@@ -6,12 +6,14 @@
 """
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path
 
+import settings
+
 BASE = Path(__file__).resolve().parent
-CFG = json.loads((BASE / "config.json").read_text(encoding="utf-8-sig"))
+# 基础画像 + 可选画像覆盖（profiles/<name>/config.json），见 settings.py
+CFG = settings.load_config()
 
 FIN_ENTITY_MARKERS = ["银行", "证券", "保险", "信托", "基金", "期货", "资产管理", "金融租赁", "消费金融", "财务公司", "理财"]
 TECH_MARKERS = ["科技", "数科", "信息", "软件", "云", "智能", "数据", "数字", "网络", "系统", "技术", "金信", "计算"]
@@ -81,26 +83,47 @@ def hard_exclude(job: dict) -> str | None:
     salary_text = job.get("salary_text", "")
     ex = CFG["exclude"]
 
+    # 0) 城市白名单：BOSS 搜索是「全国」口径（city=100010000），
+    #    画像里配了 city_allow 就只留这些城市，否则全国岗位会挤进日报。
+    allow = CFG.get("search", {}).get("city_allow") or []
+    city = job.get("city") or ""
+    if allow and not any(c and c in city for c in allow):
+        return f"城市不在范围（{city or '未标注'}）"
+
+    # 0.5) 画像自定义岗位名黑名单：法务画像用来挡实习律师 / 律师助理 / 法务专员，
+    #      这些人岗对 16 年经验的候选人属于降级，进日报只算噪音。
+    for kw in ex.get("title_block", []):
+        if kw in title:
+            return f"岗位层级不符（{kw}）"
+
     # 1) 销售岗（售前/解决方案不算销售）
     if not re.search(r"售前|解决方案|方案|架构|产品|咨询", title):
         for kw in ex["title_sales"]:
             if kw in title:
                 return f"销售类岗位（{kw}）"
 
-    # 2) 保险公司主体（科技子公司除外）
-    if _hit_terms(company, ex["company_insurance_entity"]) and not _hit_terms(company, ex["insurance_tech_whitelist"]):
-        return "保险公司主体"
+    # 2) 保险公司主体（科技子公司除外）——法务画像要投保险公司法务，可关掉
+    if ex.get("exclude_insurance_entity", True):
+        if _hit_terms(company, ex["company_insurance_entity"]) and not _hit_terms(company, ex["insurance_tech_whitelist"]):
+            return "保险公司主体"
 
     # 3) 第三方财富管理 / 投资咨询
-    for kw in ex["company_wealth"]:
+    if ex.get("exclude_wealth_company", True):
+        for kw in ex["company_wealth"]:
+            if kw in company:
+                return f"第三方财富/投资咨询类（{kw}）"
+
+    # 4) 传统金融机构（非科技子公司）——法务画像的目标就是持牌机构，可关掉
+    if ex.get("exclude_finance_entity", True):
+        if _hit_terms(company, FIN_ENTITY_MARKERS) and not _hit_terms(company, TECH_MARKERS):
+            return "传统金融机构主体"
+
+    # 5) 律所主体：法务画像只要甲方 in-house
+    for kw in ex.get("company_block", []):
         if kw in company:
-            return f"第三方财富/投资咨询类（{kw}）"
+            return f"主体不符（{kw}）"
 
-    # 4) 传统金融机构（非科技子公司）
-    if _hit_terms(company, FIN_ENTITY_MARKERS) and not _hit_terms(company, TECH_MARKERS):
-        return "传统金融机构主体"
-
-    # 5) 薪资门槛
+    # 6) 薪资门槛
     low, high = parse_salary(salary_text)
     floor = CFG["search"]["min_salary_k"]
     if high is not None:
@@ -133,7 +156,8 @@ def score_job(job: dict) -> dict:
         if hits:
             s = sc["role_max"] * spec["weight"]
             if s > role_score:
-                role_score, best_family = s, (fam, hits[0])
+                role_score = s
+                best_family = (spec.get("label") or fam, hits[0])
     parts["role"] = round(role_score, 1)
     if best_family:
         reasons.append(f"岗位族：{best_family[0]}（命中「{best_family[1]}」）")
@@ -155,7 +179,21 @@ def score_job(job: dict) -> dict:
             dom_hits.append(t)
     if title and any(t.lower() in title.lower() for t in CFG["domain_terms"]["high"]):
         dom += 4
-    parts["domain"] = round(min(dom, sc["domain_max"]), 1)
+
+    # 白名单公司：百融、同盾、恒生、蚂蚁这类公司名里没有"金融"字样，
+    # 但业务本身就是金融科技，不加这条会被当成泛行业扣分（实测误杀过百融云创）。
+    fin_hit = next((c for c in CFG.get("fintech_companies", []) if c in company), None)
+    if fin_hit:
+        dom += 8
+        dom_hits.append(f"{fin_hit}(金融科技)")
+
+    # 非金融垂直行业扣分：避免"医学售前""储能方案"被公司白名单抬成高分
+    off_hits = _hit_terms(title + " " + (job.get("industry") or ""), CFG.get("off_domain_terms", []))
+    if off_hits:
+        dom -= 3 * len(off_hits)
+        reasons.append("非金融垂直：" + "、".join(off_hits[:3]))
+
+    parts["domain"] = round(max(min(dom, sc["domain_max"]), 0.0), 1)
     if dom_hits:
         reasons.append("业务域：" + "、".join(dict.fromkeys(dom_hits))[:40])
 
@@ -197,7 +235,7 @@ def score_job(job: dict) -> dict:
     total = round(sum(parts.values()), 1)
 
     # 业务域相关度门槛：纯技术岗（与金融履历无关）降权，避免"大厂通用架构师"挤掉对口岗位
-    if parts["domain"] < 6:
+    if parts["domain"] < sc.get("domain_floor", 6):
         total = round(total * 0.75, 1)
         reasons.append("业务域相关度偏低（降权）")
 
@@ -220,8 +258,8 @@ if __name__ == "__main__":
     demo = [
         {"title": "金融行业解决方案总监", "company": "阿里云", "salary_text": "60-90K·16薪", "city": "北京",
          "tags": ["银行", "保险", "AI"], "desc": "负责金融行业大模型解决方案"},
-        {"title": "理财经理", "company": "某财富管理有限公司", "salary_text": "20-40K", "city": "大连", "tags": [], "desc": ""},
-        {"title": "保险代理人", "company": "中国人寿财产保险股份有限公司", "salary_text": "10-30K", "city": "大连", "tags": [], "desc": ""},
+        {"title": "理财经理", "company": "某财富管理有限公司", "salary_text": "20-40K", "city": "北京", "tags": [], "desc": ""},
+        {"title": "保险代理人", "company": "中国人寿财产保险股份有限公司", "salary_text": "10-30K", "city": "北京", "tags": [], "desc": ""},
         {"title": "FDE 前沿部署工程师", "company": "第四范式", "salary_text": "50-80K·14薪", "city": "上海",
          "tags": ["金融", "大模型"], "desc": "驻场交付"},
         {"title": "私人银行产品经理", "company": "招商银行", "salary_text": "40-60K", "city": "深圳", "tags": ["私行"], "desc": ""},
