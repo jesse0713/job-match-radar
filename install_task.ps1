@@ -117,9 +117,15 @@ if (-not $WatchdogAt) { $WatchdogAt = "13:30" }
 # StartWhenAvailable can replay a missed Friday run on Saturday morning.
 $weekdays = @("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")
 
+# 60 minutes, not 25. A catch-up boot starts every missed task at once. The two
+# profiles share Chrome port 9333 and take a cross-process lock, so the second
+# run waits for the first. The watchdog also waits for its own profile's daily
+# result. The limit is measured from the moment the task starts waiting, so it
+# has to cover the other profile's run plus this one. Re-run this script on an
+# existing install; editing the Python files does not update Task Scheduler.
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd -WakeToRun `
                 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                -ExecutionTimeLimit (New-TimeSpan -Minutes 25) -MultipleInstances IgnoreNew
+                -ExecutionTimeLimit (New-TimeSpan -Minutes 60) -MultipleInstances IgnoreNew
 
 $wanted = @()
 foreach ($slot in $times) {
@@ -146,7 +152,9 @@ if (Test-Path $dog) {
 }
 
 # Second profile: legal / compliance search (profiles/legal/config.json).
-# It must not overlap the base slot: both runs share the same Chrome on port 9333.
+# Both runs share Chrome on port 9333. Schedules stay staggered so a normal
+# day does not wait; run_daily holds a cross-process lock so a same-second
+# StartWhenAvailable burst cannot close the other profile's browser.
 $legalCfgPath = Join-Path $Root "profiles\legal\config.json"
 if (Test-Path $legalCfgPath) {
     $legalTimes = @("12:45")
