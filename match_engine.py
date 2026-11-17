@@ -187,10 +187,12 @@ def score_job(job: dict) -> dict:
         dom += 8
         dom_hits.append(f"{fin_hit}(金融科技)")
 
-    # 非金融垂直行业扣分：避免"医学售前""储能方案"被公司白名单抬成高分
+    # 非金融垂直行业扣分：避免"医学售前""储能方案""智算基础设施"被公司白名单抬成高分。
+    # 默认画像可以把 off_domain_penalty 调高；其他画像保持原来的每词 -3，避免连带改法务画像。
     off_hits = _hit_terms(title + " " + (job.get("industry") or ""), CFG.get("off_domain_terms", []))
+    off_penalty = 3 if CFG.get("_profile") else float(sc.get("off_domain_penalty", 3))
     if off_hits:
-        dom -= 3 * len(off_hits)
+        dom -= off_penalty * len(off_hits)
         reasons.append("非金融垂直：" + "、".join(off_hits[:3]))
 
     parts["domain"] = round(max(min(dom, sc["domain_max"]), 0.0), 1)
@@ -234,9 +236,11 @@ def score_job(job: dict) -> dict:
 
     total = round(sum(parts.values()), 1)
 
-    # 业务域相关度门槛：纯技术岗（与金融履历无关）降权，避免"大厂通用架构师"挤掉对口岗位
+    # 业务域相关度门槛：纯技术岗（与金融履历无关）降权，避免"大厂通用架构师"挤掉对口岗位。
+    # 只在默认画像使用可配置的更狠系数；法务等画像继续 ×0.75，不吃这里的收紧。
+    floor_factor = 0.75 if CFG.get("_profile") else float(sc.get("domain_floor_factor", 0.75))
     if parts["domain"] < sc.get("domain_floor", 6):
-        total = round(total * 0.75, 1)
+        total = round(total * floor_factor, 1)
         reasons.append("业务域相关度偏低（降权）")
 
     return {"score": total, "parts": parts, "reasons": reasons, "excluded": None}

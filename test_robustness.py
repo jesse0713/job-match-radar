@@ -22,8 +22,10 @@ from unittest import mock
 import chrome_lock
 import collect
 import login
+import match_engine
 import run_daily
 import run_state
+import settings
 import watchdog
 
 
@@ -841,6 +843,100 @@ class TestWatchdogCatchup(unittest.TestCase):
                 code = watchdog.main()
         self.assertEqual(code, 0)
         send.assert_not_called()
+
+
+class TestDefaultProfilePolicy(unittest.TestCase):
+    """默认画像收紧到「金融 + AI/数字化」。不改法务画像的配置。"""
+
+    def setUp(self):
+        self._orig = match_engine.CFG
+        match_engine.CFG = settings.load_config()
+
+    def tearDown(self):
+        match_engine.CFG = self._orig
+
+    def test_keywords_drop_bare_terms_and_keep_finance_ai(self):
+        cfg = settings.load_config()
+        words = cfg["keywords"]["core"] + cfg["keywords"]["extra"]
+        bare = {"售前", "数字化转型", "行业解决方案"}
+        self.assertFalse(bare & set(words))
+        for required in (
+            "金融解决方案",
+            "金融行业解决方案",
+            "金融解决方案架构师",
+            "金融业务架构师",
+            "金融科技产品",
+            "智能投顾",
+            "银行数字化",
+            "金融大模型",
+            "金融AI解决方案",
+            "财富科技",
+            "财富管理数字化",
+            "私行数字化",
+            "理财经理数字化",
+            "金融前沿部署",
+            "金融解决方案总监",
+        ):
+            self.assertIn(required, words)
+        # 财富科技经常 0 命中，近义说法要同时在
+        self.assertGreaterEqual(sum(1 for w in words if "财富" in w or "私行" in w), 3)
+        self.assertEqual(cfg["search"]["min_salary_k"], 50)
+        self.assertEqual(cfg["scoring"]["domain_floor"], 10)
+        self.assertEqual(len(cfg["keywords"]["core"]), 12)
+
+    def test_false_positives_stay_below_the_finance_solution(self):
+        generic_pm = {
+            "title": "高级产品经理", "company": "品阔", "salary_text": "50-80K",
+            "city": "上海", "scale_text": "500-999人",
+            "tags": ["AI", "SaaS", "大模型", "云计算"], "desc": "企业数字化产品",
+        }
+        infra = {
+            "title": "智算基础设施解决方案架构师", "company": "九章云极",
+            "salary_text": "50-80K", "city": "北京", "scale_text": "1000-9999人",
+            "tags": ["AI", "云计算", "大模型"], "desc": "智算中心建设",
+            "industry": "计算机软件",
+        }
+        keep = {
+            "title": "金融解决方案", "company": "某大型互联网公司",
+            "salary_text": "50-80K", "city": "杭州", "scale_text": "10000人以上",
+            "tags": ["AI"], "desc": "",
+        }
+        vendor = {
+            "title": "金融大模型解决方案架构师", "company": "华为云",
+            "salary_text": "60-90K·16薪", "city": "深圳", "scale_text": "10000人以上",
+            "tags": ["银行", "大模型", "财富管理"], "desc": "金融行业大模型",
+        }
+        wealth = {
+            "title": "智能投顾产品专家", "company": "招银云创",
+            "salary_text": "50-80K", "city": "深圳", "scale_text": "1000-9999人",
+            "tags": ["财富管理", "私人银行", "AI"], "desc": "理财经理数字化展业",
+        }
+        scored = {name: match_engine.score_job(dict(job)) for name, job in {
+            "pm": generic_pm, "infra": infra, "keep": keep, "vendor": vendor, "wealth": wealth,
+        }.items()}
+        self.assertLess(scored["pm"]["score"], 50, scored["pm"])
+        self.assertLess(scored["infra"]["score"], 50, scored["infra"])
+        self.assertGreaterEqual(scored["keep"]["score"], 60, scored["keep"])
+        self.assertGreater(scored["keep"]["score"], scored["pm"]["score"])
+        self.assertGreater(scored["keep"]["score"], scored["infra"]["score"])
+        self.assertGreaterEqual(scored["vendor"]["score"], 80, scored["vendor"])
+        self.assertGreaterEqual(scored["wealth"]["score"], 55, scored["wealth"])
+        pushed = {j["title"] for j in match_engine.rank([
+            dict(generic_pm), dict(infra), dict(keep), dict(vendor), dict(wealth),
+        ])}
+        self.assertNotIn("高级产品经理", pushed)
+        self.assertNotIn("智算基础设施解决方案架构师", pushed)
+        self.assertIn("金融解决方案", pushed)
+        self.assertIn("金融大模型解决方案架构师", pushed)
+        self.assertIn("智能投顾产品专家", pushed)
+
+    def test_ic_titles_are_blocked_and_solution_architect_is_not(self):
+        for title in ("Java开发工程师", "java开发", "后端开发工程师", "算法工程师", "机器学习工程师"):
+            job = {"title": title, "company": "阿里云", "salary_text": "50-80K", "city": "杭州"}
+            self.assertIsNotNone(match_engine.hard_exclude(job), title)
+        for title in ("金融解决方案架构师", "业务架构师", "金融售前解决方案专家"):
+            job = {"title": title, "company": "华为云", "salary_text": "60-90K", "city": "深圳"}
+            self.assertIsNone(match_engine.hard_exclude(job), title)
 
 
 if __name__ == "__main__":
