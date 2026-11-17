@@ -13,6 +13,9 @@
 wapi 接口——之前正是「掉登录后还直接打开 joblist.json」把账号越推越远。
 
 登录态存在 chrome-profile/（等同账号凭据，别外发、别提交）。
+
+和日报共用 9333。扫码或体检期间会持有同一把跨进程锁，避免把正在采集的
+Chrome 关掉，也避免日报中途把扫码窗口关掉。
 """
 from __future__ import annotations
 
@@ -232,13 +235,14 @@ def main() -> int:
     ap.add_argument("--timeout", type=int, default=300, help="等扫码的最长秒数")
     args = ap.parse_args()
 
-    collect.ensure_browser(onscreen=not args.check)
-    page = collect.attach()
+    with collect.chrome_session():
+        collect.ensure_browser(onscreen=not args.check)
+        page = collect.attach()
 
-    if not args.check:
-        bring_onscreen(page)
-        return relogin(page, args.timeout, args.keep_open)
-    return check(page)
+        if not args.check:
+            bring_onscreen(page)
+            return relogin(page, args.timeout, args.keep_open)
+        return check(page)
 
 
 if __name__ == "__main__":

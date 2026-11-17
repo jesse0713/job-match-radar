@@ -41,6 +41,21 @@ import settings  # noqa: E402  （只依赖标准库，可以安全地先导入�
 PROFILE = (_cli_value("--profile") or os.environ.get("JOB_PROFILE", "")).strip()
 settings.apply_profile_env(PROFILE)
 
+if __name__ == "__main__":
+    # 赶在 import collect（会加载 DrissionPage）之前写「正在跑」标记。
+    # 开机补跑时看门狗和日报同一秒启动；看门狗要能看见这个进程，
+    # 而不是在依赖还没导入完时就按昨天的 last_ok 发告警。
+    try:
+        import run_state as _run_state
+
+        _run_state.mark_run_started(
+            _cli_value("--slot") or "pending",
+            PROFILE or "default",
+            phase="starting",
+        )
+    except Exception:
+        pass
+
 # 依赖缺失必须被自己捕获：collect 在 import 阶段就 raise SystemExit，
 # 而计划任务用 pythonw 启动（没有控制台），异常只会变成 Task Scheduler 里的
 # 退出码 1 —— 没有日志、没有告警邮件，看起来就像任务根本没跑。
@@ -212,13 +227,32 @@ def _notes(diag: dict, fresh: list[dict]) -> list[str]:
             + "/".join(sorted({str(b.get('code')) for b in diag['blocked']}))
             + "），结果可能不完整。"
         )
+    if diag.get("chrome_restarts"):
+        notes.append(
+            f"采集中途 Chrome 调试端口断开过 {diag['chrome_restarts']} 次，"
+            "脚本已在持锁状态下重启并继续剩余关键词。若仍有关键词为 0，结果可能不完整。"
+        )
+    if diag.get("chrome_lost"):
+        notes.append("Chrome 重启后仍不可用，本次关键词没有跑完。")
     if not notes and fresh:
         notes.append("仅从 BOSS 直聘筛选，未做任何投递或沟通动作。")
     return notes
 
 
+def _phase(phase: str, **extra) -> None:
+    """更新看门狗读的运行标记。标记写失败不能影响采集。"""
+    try:
+        import run_state
+
+        run_state.update_run(phase=phase, **extra)
+    except Exception:
+        pass
+
+
 def run(args) -> None:
     page = None
+    lock = None
+    locked = False
     # 时段标签按小时判断，避免改时间后（如 12:30）被误标成"晚间"
     hour = int(args.slot.split(":")[0])
     label = "午间" if hour < 15 else "晚间"
@@ -235,6 +269,9 @@ def run(args) -> None:
              "mail": "SKIP:weekend", "diag": {"reason": "周末不推送"}})
         return
 
+    log({"event": "start", "slot": args.slot})
+    _phase("starting", slot=args.slot)
+
     try:
         if args.demo:
             demo = DEMO_JOBS_LEGAL if PROFILE == "legal" else DEMO_JOBS
@@ -242,6 +279,28 @@ def run(args) -> None:
             diag = {"boss": 0, "keywords": [], "blocked": [], "errors": [],
                     "login": None, "verify": False, "circuit": False, "demo": True}
         else:
+            # 两份画像共用 9333。先等到另一份放开，再附着；前任若已关闭 Chrome，
+            # attach → ensure_browser 会在这把锁下面自己再拉起一个。
+            lock = collect.chrome_session()
+            _phase("waiting-chrome", slot=args.slot)
+            try:
+                lock.acquire()
+            except collect.ChromeLockTimeout as e:
+                log({"fatal_stage": "chrome_lock", "slot": args.slot, "error": str(e)})
+                try:
+                    mailer.send_alert(
+                        "另一个画像正在占用共享 Chrome（端口 9333），本轮等待跨进程锁超时："
+                        + str(e)
+                        + "。本进程没有启动或关闭浏览器。请查看 logs/chrome_lock.log。"
+                        "若这是开机补跑、两份日报挤在同一秒，多半是计划任务的最长运行时间太短，"
+                        "把先跑的那份杀掉了；在项目目录重新执行 install_task.ps1。",
+                        CFG, run_label, dry_run=args.dry_run,
+                    )
+                except Exception as mail_exc:
+                    log({"fatal_mail": str(mail_exc), "slot": args.slot})
+                raise
+            locked = True
+            _phase("collecting", slot=args.slot)
             try:
                 page = collect.attach()
             except Exception as e:
@@ -250,8 +309,8 @@ def run(args) -> None:
                 try:
                     mailer.send_alert(
                         "本轮任务在启动阶段失败：无法连接自动化 Chrome（"
-                        + str(e) + "）。脚本已自动重试仍失败，通常是 9333 端口残留了"
-                        "旧 Chrome 或调试端点未就绪。请运行 python login.py --check 体检；"
+                        + str(e) + "）。脚本已拿到 9333 的跨进程锁并自动重试，仍失败。"
+                        "通常是调试端点未就绪。请运行 python login.py --check 体检；"
                         "仍不行就关掉所有自动化 Chrome 窗口后重跑。",
                         CFG, run_label, dry_run=args.dry_run,
                     )
@@ -259,7 +318,12 @@ def run(args) -> None:
                     log({"fatal_mail": str(mail_exc), "slot": args.slot})
                 raise
             raw_jobs, diag = gather(page, args.slot)
+            # 采集中途若重启过 Chrome，收尾要关的是新页面，不是一开始那个已断开的对象
+            latest = collect.active_page()
+            if latest is not None:
+                page = latest
 
+        _phase("mailing", slot=args.slot)
         scored = match_engine.rank(raw_jobs)
         limit = CFG["search"]["daily_count"]
         # demo 只用假数据验证链路，不应被生产去重库挡掉
@@ -291,8 +355,17 @@ def run(args) -> None:
         except Exception:
             pass  # pythonw 下 sys.stdout 为 None，忽略即可
     finally:
-        if page is not None and not args.keep_open:
-            collect.close_browser(page)
+        # 先关浏览器，再放锁。顺序反了的话，另一个画像会连上正要退出的 Chrome。
+        # 关浏览器若抛错，锁也必须放开，否则另一份画像会一直等到超时。
+        try:
+            if page is not None and not args.keep_open:
+                collect.close_browser(page)
+            elif page is not None and args.keep_open:
+                log({"event": "keep-open", "slot": args.slot,
+                     "note": "浏览器保留；跨进程锁释放后另一个画像可以接着用 9333"})
+        finally:
+            if locked and lock is not None:
+                lock.release()
 
 
 def _report_boot_failure(exc: BaseException, slot: str, dry_run: bool = False) -> None:
@@ -351,4 +424,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        try:
+            import run_state as _run_state
+
+            _run_state.clear_run_marker()
+        except Exception:
+            pass

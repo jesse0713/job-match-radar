@@ -43,6 +43,8 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
+import chrome_lock
+
 try:
     from DrissionPage import ChromiumPage, ChromiumOptions
 except ModuleNotFoundError as exc:  # 手动跑和计划任务可能不是同一个 Python
@@ -63,6 +65,12 @@ BASE = Path(__file__).resolve().parent
 PORT = int(os.environ.get("CHROME_DEBUG_PORT", "9333"))
 PROFILE = str(Path(os.environ.get("CHROME_PROFILE_DIR", BASE / "chrome-profile")).resolve())
 LOGIN_STATE_PATH = BASE / "logs" / "boss_login.json"
+ChromeLockTimeout = chrome_lock.ChromeLockTimeout
+
+# attach() 成功后的页面。中途重启 Chrome 会换成新对象，收尾时用它关闭。
+_ACTIVE_PAGE = None
+# 调用方没有自己持锁时，由 attach() 加锁，close_browser() 负责释放。
+_IMPLICIT_LOCK = False
 
 BOSS_CITY_ALL = "100010000"  # 全国
 BOSS_HOME = "https://www.zhipin.com/"
@@ -194,12 +202,17 @@ def ensure_browser(timeout: int = 30, onscreen: bool = False) -> None:
 
     onscreen=True 时窗口放在主屏可见位置（重新扫码登录时用）；
     默认挪到屏幕左侧外面，定时跑批时不打扰你。
+
+    必须在已经拿到跨进程锁之后调用。前一个画像若已 Browser.close，
+    这里看到端口是空的，会自己再拉起一个 Chrome。
     """
     if _browser_ready():
+        chrome_lock.log_event("reuse", port=PORT)
         return
     _close_profile_chrome()
     time.sleep(1.5)
     if _browser_ready():
+        chrome_lock.log_event("reuse", port=PORT, after_close=True)
         return
     args = [
         f"--user-data-dir={PROFILE}",
@@ -210,6 +223,7 @@ def ensure_browser(timeout: int = 30, onscreen: bool = False) -> None:
         "--window-size=1440,900", "--window-position=" + ("80,40" if onscreen else "-2400,0"),
         "--lang=zh-CN", "about:blank",
     ]
+    chrome_lock.log_event("launch", port=PORT, onscreen=bool(onscreen))
     subprocess.Popen([find_chrome(), *args], close_fds=True)
     for _ in range(timeout * 2):
         time.sleep(0.5)
@@ -221,29 +235,59 @@ def ensure_browser(timeout: int = 30, onscreen: bool = False) -> None:
     )
 
 
+def chrome_session(timeout: float | None = None) -> chrome_lock.ChromeLock:
+    """共享 9333 端口的跨进程锁。嵌套调用拿到的是同一把。"""
+    return chrome_lock.get_chrome_lock(port=PORT, timeout=timeout)
+
+
+def active_page():
+    """当前附着的页面；中途重启后这里是新的 Chrome，不是调用方手里的旧对象。"""
+    return _ACTIVE_PAGE
+
+
 def attach(retries: int = 2) -> ChromiumPage:
     """连接自动化 Chrome；握手失败时关掉重启再来一轮。
 
     单次 ChromiumPage 初始化遇到 404 手滑很常见（端口在、但浏览器端点还没就绪），
     直接抛异常会让整轮任务静默失败，所以这里必须重试。
+
+    调用方（run_daily / login）应已持有 chrome_session()。没有持锁时这里会
+    自己加锁，并在 close_browser() 里释放，避免漏锁。已经持锁时不会再向
+    操作系统取第二次，否则文件锁会把自己卡死。
     """
+    global _ACTIVE_PAGE, _IMPLICIT_LOCK
+    lock = chrome_lock.get_chrome_lock(port=PORT)
+    if not lock.held_by_current_thread():
+        lock.acquire()
+        _IMPLICIT_LOCK = True
     last: Exception | None = None
-    for _ in range(max(1, retries)):
-        try:
-            ensure_browser()
-            co = ChromiumOptions().set_local_port(PORT)
-            page = ChromiumPage(co)
-            page.set.load_mode.eager()
-            page.set.timeouts(base=12, page_load=30, script=12)
-            return page
-        except Exception as exc:
-            last = exc
+    try:
+        for _ in range(max(1, retries)):
             try:
-                _close_profile_chrome()
+                ensure_browser()
+                co = ChromiumOptions().set_local_port(PORT)
+                page = ChromiumPage(co)
+                page.set.load_mode.eager()
+                page.set.timeouts(base=12, page_load=30, script=12)
+                _ACTIVE_PAGE = page
+                return page
+            except Exception as exc:
+                last = exc
+                try:
+                    _close_profile_chrome()
+                except Exception:
+                    pass
+                time.sleep(2)
+        raise RuntimeError(f"连接自动化 Chrome 失败（端口 {PORT}）：{last}")
+    except BaseException:
+        # 连接没建立成功，调用方不会走到 close_browser，隐式锁要在这里放开
+        if _IMPLICIT_LOCK and _ACTIVE_PAGE is None:
+            _IMPLICIT_LOCK = False
+            try:
+                lock.release()
             except Exception:
                 pass
-            time.sleep(2)
-    raise RuntimeError(f"连接自动化 Chrome 失败（端口 {PORT}）：{last}")
+        raise
 
 
 def close_browser(page: ChromiumPage | None = None) -> None:
@@ -251,17 +295,64 @@ def close_browser(page: ChromiumPage | None = None) -> None:
 
     Browser.close 是正常退出流程；关不掉才兜底强杀。定时任务默认每轮结束都关，
     下次运行重新拉起（约 5 秒），比一直挂着更不容易在睡眠 / 崩溃时丢 cookie。
+
+    只释放 attach() 自己加的那把锁。run_daily 在外面持锁时，要等浏览器
+    真正关完再释放，不能在这里提前放开，否则另一个画像会连上正要退出的 Chrome。
     """
+    global _ACTIVE_PAGE, _IMPLICIT_LOCK
+    try:
+        if page is not None:
+            try:
+                page.quit(timeout=8, force=False)
+            except Exception:
+                pass
+        for _ in range(30):
+            time.sleep(0.4)
+            if not _debug_alive():
+                return
+        _close_profile_chrome()
+    finally:
+        _ACTIVE_PAGE = None
+        if _IMPLICIT_LOCK:
+            _IMPLICIT_LOCK = False
+            try:
+                chrome_lock.get_chrome_lock(port=PORT).release()
+            except Exception:
+                pass
+
+
+def _port_alive() -> bool | None:
+    try:
+        return _debug_alive()
+    except Exception:
+        return None
+
+
+def restart_browser(page: ChromiumPage | None = None, log=None) -> ChromiumPage:
+    """调试端口掉了，但本进程仍持有 Chrome 锁：清掉残留，再拉起一个新的。
+
+    等锁的另一个画像要能在前任 close 之后自己启动 Chrome；这里同理，
+    只是发生在同一轮采集的中途，锁不放开。
+    """
+    if log is None:
+        log = _say
+    try:
+        log("[boss] 调试端口已断开，正在同一把锁下重启 Chrome")
+    except Exception:
+        pass
+    chrome_lock.log_event("restart", port=PORT, message="debug port dropped; relaunching under the same lock")
     if page is not None:
         try:
-            page.quit(timeout=8, force=False)
+            page.quit(timeout=3, force=False)
         except Exception:
             pass
-    for _ in range(30):
-        time.sleep(0.4)
-        if not _debug_alive():
-            return
-    _close_profile_chrome()
+    if not _browser_ready():
+        try:
+            _close_profile_chrome()
+        except Exception:
+            pass
+        time.sleep(1.0)
+    return attach(retries=2)
 
 
 # ---------------------------------------------------------------- 页面判定
@@ -845,6 +936,7 @@ def collect_keywords(
     max_pages: int = 1,
     delay: tuple[float, float] = (3.5, 7.0),
     block_retries: int = 1,
+    max_chrome_restarts: int = 2,
     log=_say,
 ) -> tuple[list[dict], dict]:
     """按关键词逐个采集，内置退避、熔断与诊断信息。
@@ -852,14 +944,19 @@ def collect_keywords(
     - 登录失效 / 安全验证：立即停止（继续打只会更糟）。
     - 单个关键词风控：等 12–25 秒重试一次；仍被挡就跳过它。
     - 连续 3 个关键词都被挡：熔断整轮。
+    - 调试端口中途断开（另一个进程把 Chrome 关了，或浏览器自己崩了）：
+      在仍然持有跨进程锁的前提下重启 Chrome，然后继续剩下的关键词。
     """
     jobs: list[dict] = []
     diag: dict = {
         "boss": 0, "keywords": [], "blocked": [], "errors": [],
         "login": None, "verify": False, "circuit": False, "elapsed": 0.0,
+        "chrome_restarts": 0, "chrome_lost": False,
     }
     started = time.time()
     consecutive_blocks = 0
+    chrome_restarts = 0
+    restart_budget = max(0, int(max_chrome_restarts))
 
     for kw in keywords:
         rows: list[dict] = []
@@ -907,6 +1004,37 @@ def collect_keywords(
                 log(f"[boss] {kw} 风控 code={e.code}，{cool:.0f}s 后重试")
                 time.sleep(cool)
             except Exception as e:
+                port_alive = None
+                if not isinstance(e, (ConnectionError, BrokenPipeError)):
+                    port_alive = _port_alive()
+                disconnected = chrome_lock.is_chrome_disconnect(e, port_alive=port_alive)
+                if disconnected:
+                    if chrome_restarts >= restart_budget:
+                        diag["chrome_lost"] = True
+                        diag["chrome_restarts"] = chrome_restarts
+                        diag["errors"].append(f"{kw}: Chrome 断开且重启次数已用完：{type(e).__name__}: {e}")
+                        log(f"[boss] {kw} Chrome 再次断开，停止剩余关键词")
+                        diag["boss"] = len(jobs)
+                        diag["elapsed"] = round(time.time() - started, 1)
+                        return jobs, diag
+                    chrome_restarts += 1
+                    diag["chrome_restarts"] = chrome_restarts
+                    log(
+                        f"[boss] {kw} 采集时 Chrome 断开（{type(e).__name__}: {e}），"
+                        "持锁重启后继续剩余关键词"
+                    )
+                    try:
+                        page = restart_browser(page, log=log)
+                    except Exception as restart_exc:
+                        diag["chrome_lost"] = True
+                        diag["errors"].append(
+                            f"{kw}: Chrome 重启失败：{type(restart_exc).__name__}: {restart_exc}"
+                        )
+                        log(f"[boss] Chrome 重启失败，停止剩余关键词：{restart_exc}")
+                        diag["boss"] = len(jobs)
+                        diag["elapsed"] = round(time.time() - started, 1)
+                        return jobs, diag
+                    continue
                 attempt += 1
                 if attempt <= block_retries:
                     cool = random.uniform(3, 6)
@@ -931,8 +1059,9 @@ def collect_keywords(
 
 
 if __name__ == "__main__":
-    p = attach()
-    try:
-        print(json.dumps(probe(p), ensure_ascii=False, indent=2))
-    finally:
-        close_browser(p)
+    with chrome_session():
+        p = attach()
+        try:
+            print(json.dumps(probe(p), ensure_ascii=False, indent=2))
+        finally:
+            close_browser(p)

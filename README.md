@@ -8,7 +8,7 @@
 
 > **只做筛选，不做投递。** 脚本只读取搜索列表和岗位字段，不会点「立即沟通」「投递简历」，也不会自动联系招聘方。最终投不投、投哪家，由你自己决定。
 
-> 面向「金融业务 + 数字化」这类复合背景的求职场景：先把不想要的岗位挡掉（保险公司主体、第三方财富、纯销售岗、小金融机构），再在剩下的岗位里按业务域相关度排序，避免「大厂通用岗」挤掉「真正对口岗」。
+> 面向从证券、股份行、保险的财富管理和业务架构转向金融科技 / AI 的复合背景：优先 AI、云、大数据厂商的金融行业解决方案、售前和业务架构，其次是银行或保险系科技子公司的财富科技与私行数字化。先挡掉纯开发/算法岗、没有金融域的通用岗、保险公司主体的销售管理，再按金融业务域相关度排序。
 
 <p align="center">
   <img src="docs/screenshot.png" alt="示例邮件日报" width="520">
@@ -45,6 +45,8 @@
 - **认出「37 不是封禁」**：BOSS 会定期刷新 `__zp_stoken__`，搜索页会先跳到 `/web/passport/zp/security.html?code=37`，或先回到首页做 `_security_check`，由页面脚本算出新 token 再继续。脚本会等它完成（必要时刷新一次），然后重新打开搜索页；只有校验页始终不完成才停止。旧代码把这一步当成封禁，所以每次 token 过期都空手而归。
 - **风控分级处理**：`code=35/36` 才是 IP / 账号级风控，`code=37` 多数是上面的 token 刷新。单个关键词退避 12–22 秒重试一次；连续 3 个关键词都被挡才熔断，避免一个瞬时错误把整轮结果清零。
 - **登录态更耐久**：每轮结束正常关闭 Chrome（`Browser.close`），让 cookie 落盘；不再强制 `Stop-Process` 杀进程。
+- **共用 Chrome 有跨进程锁**：默认画像和法务画像共用调试端口 9333。开机补跑把两份任务挤在同一秒时，后启动的一方会等待（写入 `logs/chrome_lock.log`），前任关完浏览器后再自己拉起 Chrome。采集中途端口掉了，会在仍持有锁的情况下重启并继续剩下的关键词。
+- **看门狗不误报补跑**：和本画像日报同一秒启动时，先等这轮结束；随后落下 `SENT` 或 `SKIP` 就不再告警。
 - **硬性排除**：销售岗、保险公司主体（科技子公司放行）、第三方财富/投资咨询、传统金融机构主体、薪资不达标。
 - **六维打分**：岗位族 26 + 业务域 30 + AI/科技 14 + 层级 12 + 薪资 10 + 公司规模 8，阈值 50 分才推送。
 - **评分直接进邮件**：每条岗位显示匹配度分数、分数档位配色、六维构成；邮件标题带最高分。
@@ -127,7 +129,7 @@ python run_daily.py --demo --dry-run          # 假数据验证打分与渲染�
 python run_daily.py --slot 12:30 --dry-run    # 真实采集，只写 .eml 预览不发信
 python run_daily.py --slot 12:30              # 真实采集并发送
 python run_daily.py --demo --dry-run --profile legal   # 法务画像示例
-python -m unittest test_links -v              # 链接 + 解析 + 渲染 + 画像合并回归
+python -m unittest discover -v              # 链接、解析、渲染、Chrome 锁与看门狗补跑
 ```
 
 `outbox/` 下会生成 `.eml` 和 `preview.html`，可直接用邮件客户端打开检查版式。
@@ -144,7 +146,7 @@ powershell -ExecutionPolicy Bypass -File .\install_task.ps1
 - 逐个执行 `import DrissionPage` 探测，只注册到通过探测的解释器；
 - 同时注册 `JobMatch-Watchdog`（工作日 13:30）：当天没有任何一条成功记录（`SENT` 或 `SKIP`）时发告警邮件。
 
-如果 `profiles/legal/config.json` 存在，还会顺带注册 `JobMatch-Legal-1245`（12:45）和 `JobMatch-Legal-Watchdog`（13:45）——两个画像共用 9333 端口的 Chrome，时间必须错开。
+如果 `profiles/legal/config.json` 存在，还会顺带注册 `JobMatch-Legal-1245`（12:45）和 `JobMatch-Legal-Watchdog`（13:45）。两个画像共用 9333 端口的 Chrome：日程仍然错开，另外用一把跨进程锁，避免开机补跑时互相关掉浏览器。
 
 删除：`Unregister-ScheduledTask -TaskName "JobMatch-1230" -Confirm:$false`（`JobMatch-Legal-1245`、`JobMatch-Watchdog` 同理）。
 
@@ -153,6 +155,9 @@ powershell -ExecutionPolicy Bypass -File .\install_task.ps1
 > `WakeToRun` 已开启：电脑处于睡眠时，任务会唤醒机器执行，保证工作日准点。
 > 同时关闭了「仅电池时不启动」「切换到电池时停止」，避免笔记本拔电导致漏跑。
 > 已关机（非睡眠）时无法唤醒，由 `StartWhenAvailable` 在下次开机后补跑，且与去重库共用，不会重复推送。
+> 补跑会把当天错过的日报和看门狗在同一时刻拉起。两份画像通过跨进程锁排队使用 9333：先拿到锁的跑完并 `Browser.close`，后拿到锁的再启动自己的 Chrome。看门狗若发现本画像的 `run_in_progress.json` 还在（或宽限期内出现），会等到这轮写出 `SENT` / `SKIP` 再决定要不要告警。
+>
+> 任务最长运行时间是 60 分钟，用来盖住「先等另一份画像，再跑自己」。已经装过计划任务的机器需要重新执行一次 `install_task.ps1`，只更新代码不会改 Task Scheduler 里的旧时限。
 >
 > **路径注意**：项目目录含中文时，PowerShell 5.1 会把无 BOM 脚本按 GBK 解码，可能让注册进计划任务的路径变成乱码（`0x8007000B`）。`install_task.ps1` 已写成纯 ASCII，并用 `$PSScriptRoot` 取项目目录。若仍遇到编码问题，可建一个 ASCII junction 再装：
 >
@@ -163,13 +168,13 @@ powershell -ExecutionPolicy Bypass -File .\install_task.ps1
 
 ## 双画像：一份代码，多份简历
 
-同一套代码可以跑多份求职画像。基础 `config.json` 是「金融业务 + 数字化」方向；`profiles/<name>/config.json` 只写要覆盖的键，其余（公司规模提示、金融科技白名单等）递归沿用基础配置，避免两份配置各自漂移。
+同一套代码可以跑多份求职画像。基础 `config.json` 是默认画像：厂商侧金融解决方案 / 售前 / 业务架构 / 前沿部署，以及银行、保险系科技子公司的财富与私行数字化。`profiles/<name>/config.json` 只写要覆盖的键，其余（公司规模提示、金融科技白名单等）递归沿用基础配置，避免两份配置各自漂移。
 
 仓库内置两个画像作为示例：
 
 | 画像 | 目录 | 方向 | 推送时间 |
 |---|---|---|---|
-| （默认） | `config.json` | 金融解决方案 / FDE / 数字化 | 工作日 12:30 |
+| （默认） | `config.json` | 厂商金融解决方案 / 财富科技数字化 | 工作日 12:30 |
 | `legal` | `profiles/legal/config.json` | 法务总监 / 合规总监 | 工作日 12:45 |
 
 ```powershell
@@ -196,7 +201,7 @@ python watchdog.py --profile legal                     # 法务画像的看门�
 - **薪资下限按城市调整**：示例设 25K，一线城市可上调到 35K–40K；
 - **权重重排**：业务域 34、岗位族 26、层级 14、薪资 12、规模 8、AI 只留 6——法务岗的 AI 属性是加分项，不该和业务域同权。
 
-> 两个画像共用同一个 Chrome（端口 9333），所以时间必须错开；`install_task.ps1` 会分别注册 `JobMatch-1230` 与 `JobMatch-Legal-1245`（各带一个看门狗）。
+> 两个画像共用同一个 Chrome（端口 9333）。`install_task.ps1` 会分别注册 `JobMatch-1230` 与 `JobMatch-Legal-1245`（各带一个看门狗），时刻仍然错开；同一秒补跑时由 `chrome_lock` 排队，日志在 `logs/chrome_lock.log`（`wait` / `acquire` / `release` / `timeout`）。
 >
 > 新增画像：复制 `profiles/legal/config.json` 为 `profiles/<name>/config.json`，改关键词、城市、排除规则和权重即可，无需改代码。
 
@@ -257,7 +262,7 @@ python watchdog.py --profile legal                     # 法务画像的看门�
 | 薪资 | 10 | 达下限满分；未标注 5 分；明显偏低降权 |
 | 公司规模 | 8 | 规模档位 / 5 折算，接口缺失时用公司名提示补全 |
 
-业务域得分 < 6 的「纯技术岗」整体 ×0.75 降权。排序：`匹配分 → 公司规模 → 发布时间`。邮件里的总分与六维构成都取整显示，避免小数干扰阅读。
+默认画像的业务域门槛是 10 分：只靠公司白名单、标题里没有金融词的岗位（例如智算基础设施、通用云方案、没有金融域的产品经理）按 0.55 降权，推送线仍是 50 分。法务画像用自己的门槛，不受这档系数影响。排序：`匹配分 → 公司规模 → 发布时间`。邮件里的总分与六维构成都取整显示，避免小数干扰阅读。
 
 ## 邮件与 APP 深链
 
@@ -296,11 +301,14 @@ python watchdog.py --profile legal                     # 法务画像的看门�
 ├── links.py             # BOSS 手机网页 + H5 分享页 + APP 深链
 ├── test_links.py        # 链接、采集解析、邮件渲染回归 + 无旧站点残留守卫
 ├── collect.py           # BOSS 采集（真实搜索页监听 + DOM 兜底 + 登录态判定）
+├── chrome_lock.py       # 9333 端口的跨进程锁（Windows 命名互斥量 / 文件锁）
+├── run_state.py         # 画像级「日报正在跑」标记，供看门狗判断补跑
 ├── login.py             # 登录态体检 / 重新扫码登录（只处理 BOSS）
 ├── store.py             # SQLite 去重库
 ├── mailer.py            # SMTP 发信 + HTML 日报模板
 ├── run_daily.py         # 编排入口（--slot / --dry-run / --demo / --keep-open）
-├── watchdog.py          # 看门狗：当天没有成功推送就告警
+├── watchdog.py          # 看门狗：当天没有成功推送就告警；补跑时先等日报
+├── test_robustness.py   # Chrome 锁、断线重连、看门狗补跑（不启动浏览器）
 ├── preview_email.py     # 生成邮件预览页并截图
 ├── read_resume.py       # 把 .docx 简历抽成纯文本，便于摘录关键词
 ├── tune_domain.py       # 调整业务域词表的小工具
@@ -321,10 +329,15 @@ python watchdog.py --profile legal                     # 法务画像的看门�
 | `CHROME_PATH` | 否 | 指定 Chrome 可执行文件 |
 | `CHROME_PROFILE_DIR` | 否 | 登录态目录，默认 `./chrome-profile` |
 | `CHROME_DEBUG_PORT` | 否 | 调试端口，默认 `9333` |
+| `CHROME_LOCK_TIMEOUT` | 否 | 等待另一画像放开 Chrome 的秒数，默认 `2700`（45 分钟） |
 | `JOB_DB_PATH` | 否 | 去重库路径，默认 `./jobs.db` |
 | `JOB_PROFILE` | 否 | 默认画像名，等价于 `--profile` |
 
 ## 常见问题与排查
+
+**开机后两份日报和看门狗挤在同一秒？**
+
+这是 `StartWhenAvailable` 补跑。两份画像会排队用 9333，而不是同时操作同一个 Chrome。看 `logs/chrome_lock.log`：应有 `wait`，然后 `acquire`，跑完是 `release`。后启动的那份会在前任关闭浏览器之后自己再拉起 Chrome。看门狗在本画像日报还在跑时不会发「昨天没有成功」的告警；日报写出 `SENT` 或 `SKIP` 后它直接结束。
 
 **任务准点触发，但没有日志也没有邮件？**
 
