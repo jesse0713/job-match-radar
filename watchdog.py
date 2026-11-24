@@ -10,14 +10,16 @@ SystemExit；pythonw 没有控制台，于是失败是「完全静默」的。
 
 run_daily.py 现在会自己捕获这种启动失败并发告警，但那只覆盖「能启动」的情况。
 这个看门狗是第二道保险：它只依赖标准库 + mailer，每个工作日 13:30 检查一次
-daily.log，只要今天还没有一条成功记录（SENT 发信 / SKIP 无新增），就发邮件
-说明情况；同一天只告警一次。
+daily.log，只要今天还没有一条成功采集，就发邮件说明情况；同一天只告警一次。
+
+成功指：采集到了岗位之后的 ``SENT``（日报），或采集成功但没有新岗位的
+``SKIP:no-new``。``send_alert`` 失败时也会返回 ``SENT:``，但 ``collected=0``、
+熔断（circuit）或环境校验失败（verify）不算成功，last_ok 不往前走。告警信
+照发。午间因环境 token 失败时，晚间补跑任务会再试一次，看门狗不负责补采。
 
 开机补跑（StartWhenAvailable）会把日报和看门狗在同一秒拉起。这时 last_ok
 还是昨天，但日报马上就会成功。看门狗先等本画像的 run_in_progress 标记，
-或等一条今天的 SENT / SKIP 落盘，再决定要不要告警。
-
-"SKIP:no-new" 也算成功：采集正常、只是当天没有新岗位，属于健康状态。
+或等一条今天的成功记录落盘，再决定要不要告警。
 
 用法：
     python watchdog.py                 # 检查并告警
@@ -56,7 +58,8 @@ PROFILE = (_cli_value("--profile") or os.environ.get("JOB_PROFILE", "")).strip()
 settings.apply_profile_env(PROFILE)
 
 LOG_DIR = Path(os.environ.get("JOB_LOG_DIR", BASE / "logs"))
-OK_PREFIXES = ("SENT:", "SKIP:")
+# 晚间补跑和午间失败至少隔这么久，避免 code=37 之后紧挨着再打一轮。
+CATCHUP_MIN_BACKOFF_S = 60 * 60
 # 同一秒补跑时，日报可能还在 import，或正在等另一画像放开 Chrome。
 # 正常失败日多等这一分钟再告警；补跑日则一直等到这轮写出 SENT / SKIP。
 CATCHUP_GRACE_S = 60.0
@@ -106,11 +109,148 @@ def _describe(entry: dict) -> str:
     )
 
 
+def row_is_success(row: dict, *, honor_flag: bool = True) -> bool:
+    """这条日报算不算「采集成功」。
+
+    - ``SKIP:no-new`` 且确实采到过岗位：成功（没有新岗位可发）。
+    - ``SENT:`` 且 ``collected>0``、没有熔断 / 校验页 / 掉登录：成功（日报）。
+    - ``send_alert`` 也返回 ``SENT:``。``collected=0``、``circuit``、``verify``
+      或显式 ``ok: false`` 都是告警，不是 last_ok。
+    - 旧日志没有 ``collected`` 时，仍把纯 ``SENT:`` / ``SKIP:no-new`` 视为成功。
+
+    ``honor_flag=False`` 用来在写日志时计算 ``ok``，避免读到自己刚写的标记。
+    """
+    if not isinstance(row, dict):
+        return False
+    if honor_flag and row.get("ok") is True:
+        return True
+    if honor_flag and row.get("ok") is False:
+        return False
+    mail = str(row.get("mail") or "")
+    diag = row.get("diag") if isinstance(row.get("diag"), dict) else {}
+    # --demo 用的是假岗位，不能当成当天 BOSS 采集成功，也不能抵消晚间补跑。
+    if diag.get("demo"):
+        return False
+    if mail.startswith("SKIP:no-new"):
+        if diag.get("verify") or diag.get("login"):
+            return False
+        collected = row.get("collected")
+        if collected is None:
+            return True
+        try:
+            return int(collected) > 0
+        except (TypeError, ValueError):
+            return False
+    if not mail.startswith("SENT:"):
+        return False
+    if diag.get("verify") or diag.get("circuit") or diag.get("login"):
+        return False
+    collected = row.get("collected")
+    if collected is None:
+        return True
+    try:
+        return int(collected) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _blocked_code_37(diag: dict) -> bool:
+    for item in diag.get("blocked") or []:
+        if isinstance(item, dict) and str(item.get("code")) == "37":
+            return True
+    blob = json.dumps(diag, ensure_ascii=False)
+    if "环境异常" in blob or "__zp_stoken__" in blob or "环境校验" in blob:
+        return True
+    if "security.html" in blob:
+        return True
+    return False
+
+
+def needs_token_catchup(row: dict) -> bool:
+    """午间这次失败，是否值得晚上用官方页面再试一次。
+
+    熔断、校验页没完成、或 collected=0 且诊断里是 code=37 / 环境异常。
+    掉登录要人工扫码，补跑解决不了。``SKIP:no-new`` 不是失败。
+    """
+    if not isinstance(row, dict) or row_is_success(row):
+        return False
+    mail = str(row.get("mail") or "")
+    if mail.startswith("SKIP:"):
+        return False
+    if "mail" not in row and "diag" not in row:
+        return False
+    diag = row.get("diag") if isinstance(row.get("diag"), dict) else {}
+    if diag.get("login"):
+        return False
+    if diag.get("verify") or diag.get("circuit"):
+        return True
+    try:
+        empty = row.get("collected") is not None and int(row.get("collected")) <= 0
+    except (TypeError, ValueError):
+        empty = False
+    if empty or mail.startswith("SENT:"):
+        return _blocked_code_37(diag)
+    return False
+
+
+def catchup_decision(
+    entries,
+    *,
+    now: datetime,
+    min_backoff_s: float = CATCHUP_MIN_BACKOFF_S,
+    marker: dict | None = None,
+    own_pid: int | None = None,
+    marker_live=None,
+) -> tuple[bool, str]:
+    """晚间任务要不要真的再采一次。
+
+    只有「今天已经有一次环境/token 失败，而且距离那次至少 ``min_backoff_s``」
+    才返回 True。成功采集、``SKIP:no-new``、掉登录、刚失败不到退避时间、
+    今天已经补跑过，都不再打。另一个进程还占着本画像时返回 in-progress，
+    这次不算把补跑机会用掉。
+    """
+    if marker_live is None:
+        marker_live = run_state.marker_is_live
+    if isinstance(marker, dict) and own_pid is not None:
+        try:
+            if int(marker.get("pid") or -1) == int(own_pid):
+                marker = None
+        except (TypeError, ValueError):
+            pass
+    if marker and marker_live(marker, now=now):
+        return False, "in-progress"
+
+    today = []
+    for row in entries or []:
+        if not isinstance(row, dict):
+            continue
+        ts = _parse_ts(row.get("ts", ""))
+        if ts is None or ts.date() != now.date():
+            continue
+        today.append((ts, row))
+    if any(row_is_success(row) for _, row in today):
+        return False, "already-ok"
+    retried = [
+        row for _, row in today
+        if row.get("catchup") and str(row.get("mail") or "")
+        and not str(row.get("mail") or "").startswith("SKIP:catchup")
+    ]
+    if retried:
+        return False, "already-retried"
+    failures = [(ts, row) for ts, row in today if needs_token_catchup(row)]
+    if not failures:
+        return False, "no-failed-collect"
+    latest_ts = max(ts for ts, _ in failures)
+    if (now - latest_ts).total_seconds() < float(min_backoff_s):
+        return False, "too-soon"
+    return True, "retry-token-failure"
+
+
 def success_in_window(entries, *, started: datetime, max_age_hours: float = 0):
-    """最近一条 SENT / SKIP 是否落在「今天」或给定的小时窗口里。"""
+    """最近一条成功采集是否落在「今天」或给定的小时窗口里。"""
     ok_rows = []
     for row in entries or []:
-        if not str(row.get("mail") or "").startswith(OK_PREFIXES):
+        if not row_is_success(row):
             continue
         ts = _parse_ts(row.get("ts", ""))
         if ts is None:
@@ -143,7 +283,8 @@ def poll_until_settled(
 ) -> dict:
     """等日报结果，或确认这轮并没有跑起来。
 
-    - 今天已经有 SENT / SKIP：立刻返回，不发告警。
+    - 今天已经有成功采集（有结果的 SENT，或 SKIP:no-new）：立刻返回，不发告警。
+      告警邮件的 SENT（collected=0 / 熔断 / 校验失败）不算。
     - 宽限期内出现「正在跑」标记，或随后写出成功记录：继续等，成功则不告警。
     - 宽限期内什么都没出现：按失败告警（和平时 13:30 的行为一致，只是晚一分钟）。
     - 标记消失后仍再等一小段，避免成功日志比标记晚一点点落盘。
@@ -338,7 +479,9 @@ def main() -> int:
     elif outcome["waited_s"] >= 1:
         waited_note = (
             f"看门狗启动后先等了 {outcome['waited_s']:.0f} 秒"
-            f"（{outcome['reason']}），没有看到本画像今天的 SENT / SKIP。\n\n"
+            f"（{outcome['reason']}），没有看到本画像今天的成功采集"
+            "（有结果的日报，或采集成功后的 SKIP:no-new）。"
+            "告警邮件不算成功。\n\n"
         )
 
     last_any = entries[-1] if entries else None
@@ -356,7 +499,9 @@ def main() -> int:
         "常见原因：",
         "  1) 计划任务指向的 Python 缺少 DrissionPage（DSH 升级重建运行时会导致）；",
         "  2) 登录态失效 —— 需要运行 python login.py 重新扫码；",
-        "  3) BOSS 风控熔断（code=37） —— 等 30–60 分钟或换网络后重跑。",
+        "  3) BOSS 环境 token（code=37 / security.html）没在无人值守的 Chrome 里写完。",
+        "     午间告警邮件不算成功。晚间补跑任务会再试一次，不会立刻连打；",
+        "     仍失败就运行 python login.py，让窗口里的官方校验页走完。",
         "",
         f"最近一条日志：{_describe(last_any) if last_any else '（日志为空）'}",
         "",

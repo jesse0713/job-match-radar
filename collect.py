@@ -18,12 +18,15 @@
 - 搜索页被重定向到 ``/web/user/``，或页面出现「扫码登录 / 验证码登录」= 登录失效；
   立即停止，不再打接口，也不再拿剩下的关键词硬试。
 - ``code=37`` 大多数时候是 BOSS 每天刷新 ``__zp_stoken__`` 的环境校验页
-  （``/web/passport/zp/security.html``），不是封禁。等页面脚本算出新 token 再继续；
-  偶尔第一次加载卡住，刷新一次即可。
+  （``/web/passport/zp/security.html``），不是封禁。等页面自己的脚本写好新 cookie
+  再继续。页停在「正在加载中…」（校验 JS 没启动）时，重新加载当前这个官方
+  security 页，仍只使用页面下发的 seed/ts，不自己算 token。
 - stoken 缺失 / 过期时 BOSS 还可能先送回首页并带 ``?_security_check=...``；
-  脚本会等首页生成新 token，再重新打开搜索页，每轮只回首页触发一次。
+  脚本会轮询到首页写下新 cookie，再重新打开搜索页。每轮采集只回首页触发一次。
+- 正式采集前先做一次和 ``login.py --check`` 同类的预检：官方页走完校验后，
+  用探测词打一次搜索。仍是 code=37 就停，不把当天关键词再打一遍。
 - 接口返回 ``code=7`` 同样按登录失效处理；``code=35/36`` 才是 IP / 账号级风控，
-  退避后重试，连续 3 个关键词都被挡才熔断。
+  退避后重试，连续 3 个关键词都被挡才熔断。预检阶段遇到 35/36/37 直接停。
 
 参考资料：
 - DrissionPage 的 listen 网络监听（https://github.com/g1879/DrissionPage）
@@ -78,6 +81,14 @@ BOSS_LOGIN_URL = "https://www.zhipin.com/web/user/?ka=header-login"
 BOSS_SEARCH_URL = "https://www.zhipin.com/web/geek/jobs"
 BOSS_API_PATH = "/wapi/zpgeek/search/joblist.json"
 PROBE_KEYWORD = "金融解决方案"
+
+# 环境校验只等官方页面自己写 cookie。这些是等待预算，不是签名参数。
+# security.html 停在「正在加载中」时，隔一会儿再刷新当前官方 URL，避免空转。
+SECURITY_WAIT_S = 90.0
+SECURITY_STUCK_S = 12.0
+SECURITY_RELOADS = 3
+HOME_TOKEN_WAIT_S = 45.0
+TOKEN_POLL_S = 0.5
 
 BOSS_CODES = {
     0: "正常",
@@ -412,43 +423,256 @@ def _wait_ready(tab, timeout: float = 10.0) -> str:
     return state
 
 
-def _resolve_security(tab, timeout: float = 45.0) -> str:
+def _page_body(tab) -> str:
+    try:
+        return tab.run_js("return document.body?document.body.innerText:''") or ""
+    except Exception:
+        return ""
+
+
+def security_js_stuck(body: str) -> bool:
+    """security / 首页校验停在「正在加载中」，说明官方脚本没跑起来。
+
+    只认很短的加载壳。正常岗位页正文很长，即便碰巧出现这几个字也不算卡住。
+    """
+    text = (body or "").replace("\u2026", "").replace("...", "").strip()
+    if not text:
+        return True
+    if "正在加载" not in text:
+        return False
+    compact = re.sub(r"\s+", "", text)
+    return len(compact) <= 24
+
+
+def token_is_fresh(before, after) -> bool:
+    """官方页面是否写下了一个新的 ``__zp_stoken__``。
+
+    ``before`` / ``after`` 是 ``(value, expires)`` 或 None。只比较浏览器里
+    已经存在的 cookie，不计算、不改写。
+    """
+    if not after or not after[0]:
+        return False
+    if not before or not before[0]:
+        return True
+    if after[0] != before[0]:
+        return True
+    try:
+        return float(after[1] or 0) > float(before[1] or 0) + 30
+    except (TypeError, ValueError):
+        return False
+
+
+def _advance(sleep, now, step: float) -> bool:
+    """睡一步。时钟没往前走就返回 False，避免测试或坏时钟空转。"""
+    if step <= 0:
+        return False
+    moved = now()
+    sleep(step)
+    return now() > moved
+
+
+def resolve_security_wait(
+    sample,
+    reload_page,
+    *,
+    timeout: float = SECURITY_WAIT_S,
+    stuck_after: float = SECURITY_STUCK_S,
+    max_reloads: int = SECURITY_RELOADS,
+    poll: float = TOKEN_POLL_S,
+    sleep=None,
+    now=None,
+    before=None,
+) -> str:
+    """等 BOSS 自己的 security.html 跳走，或等它写下新 cookie。
+
+    ``sample()`` 返回 ``(state, body, token)``。``reload_page()`` 只刷新当前
+    已经打开的官方 URL（带原来的 seed/ts/name），不新造校验地址。
+
+    - 离开 security 页：返回新的页面状态（``ok`` / ``login`` / …）
+    - cookie 已更新但页面还停着：返回 ``refreshed``，调用方再打开搜索页
+    - 到点仍停在校验页：返回 ``security``
+    """
+    sleep = sleep or time.sleep
+    now = now or time.time
+    poll = float(poll) if poll and poll > 0 else TOKEN_POLL_S
+    deadline = now() + max(0.0, float(timeout))
+    reloads = 0
+    stuck_since = None
+    baseline = before
+    baselined = before is not None
+
+    while True:
+        state, body, token = sample()
+        if not baselined:
+            baseline = token
+            baselined = True
+        if state != "security":
+            return state or "blank"
+        if token_is_fresh(baseline, token):
+            grace_deadline = min(deadline, now() + 8.0)
+            while now() < grace_deadline:
+                state, body, token = sample()
+                if state != "security":
+                    return state or "ok"
+                step = min(poll, max(0.0, grace_deadline - now()))
+                if not _advance(sleep, now, step):
+                    break
+            return "refreshed"
+        if now() >= deadline:
+            return "security"
+        if security_js_stuck(body or ""):
+            if stuck_since is None:
+                stuck_since = now()
+            elif (now() - stuck_since) >= float(stuck_after) and reloads < int(max_reloads):
+                reload_page()
+                reloads += 1
+                stuck_since = None
+        else:
+            stuck_since = None
+        step = min(poll, max(0.0, deadline - now()))
+        if not _advance(sleep, now, step):
+            return "security"
+
+
+def wait_for_fresh_stoken(
+    sample,
+    reload_page,
+    *,
+    before,
+    timeout: float = HOME_TOKEN_WAIT_S,
+    stuck_after: float = SECURITY_STUCK_S,
+    max_reloads: int = SECURITY_RELOADS,
+    poll: float = TOKEN_POLL_S,
+    sleep=None,
+    now=None,
+) -> str:
+    """在官方首页 / ``_security_check`` 上等到新 cookie，或确认进了校验页。
+
+    返回 ``ok``（cookie 已更新）、``security`` / ``login`` / ``verify``（交给
+    对应流程），或 ``timeout``。加载壳卡住时刷新当前官方页，次数有上限。
+    """
+    sleep = sleep or time.sleep
+    now = now or time.time
+    poll = float(poll) if poll and poll > 0 else TOKEN_POLL_S
+    deadline = now() + max(0.0, float(timeout))
+    reloads = 0
+    stuck_since = None
+
+    while True:
+        state, body, token = sample()
+        if state == "security":
+            return "security"
+        if state in ("login", "verify"):
+            return state
+        if token_is_fresh(before, token):
+            return "ok"
+        if now() >= deadline:
+            return "timeout"
+        if security_js_stuck(body or ""):
+            if stuck_since is None:
+                stuck_since = now()
+            elif (now() - stuck_since) >= float(stuck_after) and reloads < int(max_reloads):
+                reload_page()
+                reloads += 1
+                stuck_since = None
+        else:
+            stuck_since = None
+        step = min(poll, max(0.0, deadline - now()))
+        if not _advance(sleep, now, step):
+            return "timeout"
+
+
+def _sample_tab(tab):
+    try:
+        url = tab.url or ""
+    except Exception:
+        url = ""
+    try:
+        cards = len(tab.eles("css:.job-card-box", timeout=0.2))
+    except Exception:
+        cards = 0
+    body = _page_body(tab)
+    return classify_page(url, body, cards), body, _read_stoken(tab)
+
+
+def _reload_current(tab, why: str) -> None:
+    """刷新当前已经打开的官方页。不拼接新的 security URL，也不写 cookie。"""
+    try:
+        _say(f"[boss] {why}，重新加载当前官方页面")
+    except Exception:
+        pass
+    try:
+        tab.refresh()
+    except Exception:
+        pass
+
+
+def _resolve_security(tab, timeout: float = SECURITY_WAIT_S, before=None, **wait_kw) -> str:
     """等 BOSS 的环境校验页自己生成 __zp_stoken__ 并跳走。
 
-    实测第一次打开偶尔会停在「正在加载中…」（324KB 的 security JS 没跑起来），
-    刷新一次就会正常生成 token 并跳回。所以这里只等，不提前判死。
+    停在「正在加载中…」（校验 JS 没跑起来）时，隔一段时间刷新当前官方
+    security 页，最多几次。不提前判死，也不自己算 token。
     """
-    end = time.time() + timeout
-    while time.time() < end:
-        state = _page_state(tab)
-        if state != "security":
-            return state
-        time.sleep(0.5)
-    return "security"
+    return resolve_security_wait(
+        lambda: _sample_tab(tab),
+        lambda: _reload_current(tab, "环境校验页停在「正在加载中」"),
+        timeout=timeout,
+        before=before,
+        **wait_kw,
+    )
 
 
-def _open_and_settle(tab, url: str, page_timeout: float = 10.0,
-                     security_timeout: float = 45.0, tries: int = 3) -> str:
+def _is_boss_home(url: str) -> bool:
+    try:
+        from urllib.parse import urlparse
+
+        parts = urlparse(url or "")
+    except Exception:
+        return False
+    if "zhipin.com" not in (parts.netloc or "").lower():
+        return False
+    return (parts.path or "/") in ("", "/")
+
+
+def _wait_homepage_check(tab, before=None, timeout: float = HOME_TOKEN_WAIT_S, **wait_kw) -> str:
+    """首页 ``_security_check``：等官方脚本写 cookie；若跳进 security.html 就接着等。"""
+    if before is None:
+        before = _read_stoken(tab)
+    outcome = wait_for_fresh_stoken(
+        lambda: _sample_tab(tab),
+        lambda: _reload_current(tab, "首页环境校验停在「正在加载中」"),
+        before=before,
+        timeout=timeout,
+        **wait_kw,
+    )
+    if outcome != "security":
+        return outcome
+    resolved = _resolve_security(tab, timeout=max(float(timeout), SECURITY_WAIT_S), before=before)
+    if resolved == "security":
+        return "security"
+    if resolved in ("ok", "refreshed") or token_is_fresh(before, _read_stoken(tab)):
+        return "ok"
+    return resolved
+
+
+def _open_and_settle(tab, url: str, page_timeout: float = 12.0,
+                     security_timeout: float | None = None, tries: int = 3) -> str:
     """打开搜索页；处理环境校验、首页安全跳转，必要时重试。
 
     stoken 缺失 / 过期时，BOSS 有时不直接给 security.html，而是先把人送回
-    首页并带上 ``?_security_check=1_...``；首页脚本会在几秒内生成新 token。
-    所以这里要检查“到底有没有停在搜索页”，没停就等一会儿再开一次。
+    首页并带上 ``?_security_check=...``。这里会轮询到新 cookie 出现（加载壳
+    卡住就刷新当前官方页），再重新打开搜索页。
     """
+    if security_timeout is None:
+        security_timeout = SECURITY_WAIT_S
     state = "blank"
     for _ in range(max(1, tries)):
+        before = _read_stoken(tab)
         tab.get(url)
         state = _wait_ready(tab, timeout=page_timeout)
 
         if state == "security":
-            state = _resolve_security(tab, timeout=security_timeout)
-            if state == "security":
-                # 第一次加载可能卡住：刷新一次通常就能把 token 生成出来
-                try:
-                    tab.refresh()
-                except Exception:
-                    pass
-                state = _resolve_security(tab, timeout=security_timeout)
+            state = _resolve_security(tab, timeout=security_timeout, before=before)
             if state == "security":
                 return "security"
             time.sleep(1.0)
@@ -461,10 +685,25 @@ def _open_and_settle(tab, url: str, page_timeout: float = 10.0,
             current = tab.url or ""
         except Exception:
             current = ""
-        if "/web/geek/job" in current:
+        on_search = "/web/geek/job" in current
+        if on_search and state == "ok" and _read_stoken(tab):
             return state
+        if (not on_search) and ("_security_check" in current or _is_boss_home(current)):
+            _wait_homepage_check(
+                tab, before=before, timeout=min(60.0, float(security_timeout)),
+            )
+            continue
+        if on_search and not _read_stoken(tab):
+            # 搜索壳出来了，但环境 cookie 还没有：回官方首页走一次 _security_check。
+            try:
+                tab.get(BOSS_HOME)
+            except Exception:
+                return state
+            _wait_homepage_check(
+                tab, before=before, timeout=min(60.0, float(security_timeout)),
+            )
+            continue
 
-        # 被送到首页做 _security_check：给首页脚本一点时间生成 token，再开搜索页
         time.sleep(2.5)
 
     return state
@@ -473,40 +712,63 @@ def _open_and_settle(tab, url: str, page_timeout: float = 10.0,
 _TOKEN_BOUNCED = False
 
 
+def _read_stoken(tab):
+    """读 zhipin 域上还没过期的 ``__zp_stoken__``，返回 ``(value, expires)``。
+
+    读不到就返回 None。调用方只拿它做前后对比，不会写回浏览器。
+    """
+    now_ts = time.time()
+    best = None
+    try:
+        cookies = tab.run_cdp("Network.getAllCookies").get("cookies", [])
+    except Exception:
+        return None
+    for c in cookies:
+        if c.get("name") != "__zp_stoken__" or "zhipin" not in str(c.get("domain", "")):
+            continue
+        value = str(c.get("value") or "")
+        if not value:
+            continue
+        try:
+            exp = float(c.get("expires") or 0)
+        except (TypeError, ValueError):
+            exp = 0.0
+        # expires<=0 是会话 cookie，算存在；已经到期的丢掉。
+        if exp > 0 and exp <= now_ts + 30:
+            continue
+        if best is None or exp > best[1]:
+            best = (value, exp)
+    return best
+
+
 def _has_stoken(tab) -> bool:
     """确认存在一个还没过期的 __zp_stoken__。"""
-    now = time.time()
-    try:
-        for c in tab.run_cdp("Network.getAllCookies").get("cookies", []):
-            if c.get("name") != "__zp_stoken__" or "zhipin" not in str(c.get("domain", "")):
-                continue
-            exp = c.get("expires", -1)
-            if not exp or exp > now + 60:
-                return True
-    except Exception:
-        pass
-    return False
+    return _read_stoken(tab) is not None
 
 
 def _bounce_for_token(tab, url: str) -> bool:
     """接口返回 37 且页面不是 security.html 时，用首页触发一次 token 刷新。
 
-    首页会带 ``?_security_check=...`` 跑一遍 security JS；这里轮询 cookie，
-    确认新的 ``__zp_stoken__`` 真的落下来，再回搜索页。每轮采集只做一次。
+    首页会带 ``?_security_check=...`` 跑一遍官方 security JS。这里等到 cookie
+    的值真的变了再回搜索页。每轮采集只做一次，失败也不连打。
     """
     global _TOKEN_BOUNCED
     if _TOKEN_BOUNCED:
         return False
     _TOKEN_BOUNCED = True
+    before = _read_stoken(tab)
     try:
         tab.get(BOSS_HOME)
-        end = time.time() + 15
-        while time.time() < end and not _has_stoken(tab):
-            time.sleep(0.5)
+        outcome = _wait_homepage_check(tab, before=before, timeout=HOME_TOKEN_WAIT_S)
         tab.get(url)
-        _wait_ready(tab, timeout=10)
+        state = _wait_ready(tab, timeout=12)
+        if state == "security":
+            state = _resolve_security(tab, timeout=SECURITY_WAIT_S, before=before)
+            if state != "security":
+                tab.get(url)
+                _wait_ready(tab, timeout=10)
         time.sleep(2.0)  # 给 cookie 落盘和页面初始化留一点时间
-        return True
+        return outcome in ("ok", "refreshed") or token_is_fresh(before, _read_stoken(tab))
     except Exception:
         return False
 
@@ -889,7 +1151,7 @@ def login_state(page: ChromiumPage, tab=None) -> dict:
     tab = tab or page.latest_tab
     try:
         state = _open_and_settle(tab, search_url(PROBE_KEYWORD), page_timeout=12,
-                                 security_timeout=30)
+                                 security_timeout=SECURITY_WAIT_S)
     except Exception as e:
         return {"state": "err", "detail": f"{type(e).__name__}: {e}", "url": "", "cards": 0}
     if state == "login":
@@ -920,6 +1182,95 @@ def probe(page: ChromiumPage) -> dict:
     return info
 
 
+def _preflight_result(
+    *,
+    ok: bool,
+    count: int = 0,
+    login=None,
+    verify: bool = False,
+    circuit: bool = False,
+    blocked=None,
+    errors=None,
+    elapsed: float = 0.0,
+    detail: str = "",
+) -> dict:
+    diag = {
+        "boss": 0,
+        "keywords": [],
+        "blocked": list(blocked or []),
+        "errors": list(errors or []),
+        "login": login,
+        "verify": verify,
+        "circuit": circuit,
+        "elapsed": elapsed,
+        "chrome_restarts": 0,
+        "chrome_lost": False,
+        "preflight": True,
+    }
+    return {"ok": ok, "count": count, "detail": detail, "diag": diag}
+
+
+def preflight(page: ChromiumPage, log=None) -> dict:
+    """正式关键词之前的环境体检，和 ``login.py --check`` 同一条链路。
+
+    打开真实搜索页，让 security.html 或首页 ``_security_check`` 把
+    ``__zp_stoken__`` 写完，再探测一次搜索。code=37 / 校验页没完成就停，
+    不把当天每个关键词再打一遍。探测词的结果不进入日报。
+    """
+    global _TOKEN_BOUNCED
+    if log is None:
+        log = _say
+    _TOKEN_BOUNCED = False
+    started = time.time()
+    try:
+        log("[boss] 预检：打开搜索页，等待官方环境校验，并探测一次搜索")
+    except Exception:
+        pass
+    try:
+        jobs = search(page, PROBE_KEYWORD)
+    except BossLoginRequired as e:
+        return _preflight_result(
+            ok=False, login="required",
+            errors=[f"登录态失效：{e}"],
+            elapsed=round(time.time() - started, 1),
+            detail=str(e),
+        )
+    except BossVerifyRequired as e:
+        return _preflight_result(
+            ok=False, verify=True,
+            errors=[f"安全验证：{e}"],
+            elapsed=round(time.time() - started, 1),
+            detail=str(e),
+        )
+    except BossBlocked as e:
+        return _preflight_result(
+            ok=False, circuit=True,
+            blocked=[{"keyword": PROBE_KEYWORD, "code": e.code, "msg": e.message}],
+            errors=[f"预检：{PROBE_KEYWORD}: 风控 code={e.code}，已停止，避免连打关键词"],
+            elapsed=round(time.time() - started, 1),
+            detail=str(e),
+        )
+    except Exception as e:
+        # 预检自己的页面抖动不该把整天取消；关键词循环仍会处理断线和风控。
+        try:
+            log(f"[boss] 预检异常（{type(e).__name__}），继续关键词")
+        except Exception:
+            pass
+        return _preflight_result(
+            ok=True,
+            errors=[f"预检异常已忽略：{type(e).__name__}: {e}"],
+            elapsed=round(time.time() - started, 1),
+            detail=f"{type(e).__name__}: {e}",
+        )
+    try:
+        log(f"[boss] 预检通过：{len(jobs)} 条")
+    except Exception:
+        pass
+    return _preflight_result(
+        ok=True, count=len(jobs), elapsed=round(time.time() - started, 1),
+    )
+
+
 # ---------------------------------------------------------------- 批量采集
 def _say(msg: str) -> None:
     """计划任务用 pythonw 跑，sys.stdout 是 None，print 会抛异常——静默兜住。"""
@@ -938,15 +1289,22 @@ def collect_keywords(
     block_retries: int = 1,
     max_chrome_restarts: int = 2,
     log=_say,
+    reset_token_bounce: bool = True,
 ) -> tuple[list[dict], dict]:
     """按关键词逐个采集，内置退避、熔断与诊断信息。
 
     - 登录失效 / 安全验证：立即停止（继续打只会更糟）。
     - 单个关键词风控：等 12–25 秒重试一次；仍被挡就跳过它。
-    - 连续 3 个关键词都被挡：熔断整轮。
+    - 连续 3 个关键词都被挡：熔断整轮。code=37 的首页回跳每轮只做一次。
     - 调试端口中途断开（另一个进程把 Chrome 关了，或浏览器自己崩了）：
       在仍然持有跨进程锁的前提下重启 Chrome，然后继续剩下的关键词。
+
+    ``reset_token_bounce=False`` 用于预检已经做过那一次首页回跳的正式采集，
+    避免同一个进程里再紧挨着打第二次。
     """
+    global _TOKEN_BOUNCED
+    if reset_token_bounce:
+        _TOKEN_BOUNCED = False
     jobs: list[dict] = []
     diag: dict = {
         "boss": 0, "keywords": [], "blocked": [], "errors": [],

@@ -18,13 +18,14 @@
     "weekdays_only": true,
     "skip_when_no_new": true,
     "watchdog_time": "13:30",
+    "catchup_time": "19:00",
     "keyword_delay_seconds": [
       3.5,
       7.0
     ],
     "block_retries": 1,
     "login_wait_seconds": 300,
-    "_note": "工作日 12:30 跑一次、发一封；周末不发。skip_when_no_new=true 时，当天没有新岗位就不发信（只在日志里记 SKIP），避免空邮件。"
+    "_note": "工作日 12:30 跑一次、发一封；周末不发。skip_when_no_new=true 时，当天没有新岗位就不发信（只在日志里记 SKIP），避免空邮件。catchup_time 是晚间补跑：只有午间因环境 token 失败才再试一次，成功或 SKIP:no-new 不会跑。"
   },
   "keywords": {
     "_note": "默认画像转向金融科技/AI：搜索词必须带金融或财富/私行语境，不再用裸的「售前」「数字化转型」「行业解决方案」。core 每天 12 个；extra 每天轮换 1 个。财富科技命中少，所以同时保留财富管理数字化、私行数字化等近义说法。",

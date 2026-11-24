@@ -391,7 +391,10 @@ class TestDisconnectRecovery(unittest.TestCase):
 
 class TestRunOrchestration(unittest.TestCase):
     def _args(self, **overrides):
-        values = dict(slot="12:30", dry_run=True, demo=False, keep_open=False, force=True, profile="")
+        values = dict(
+            slot="12:30", dry_run=True, demo=False, keep_open=False,
+            force=True, profile="", catch_up=False,
+        )
         values.update(overrides)
         return argparse.Namespace(**values)
 
@@ -843,6 +846,456 @@ class TestWatchdogCatchup(unittest.TestCase):
                 code = watchdog.main()
         self.assertEqual(code, 0)
         send.assert_not_called()
+
+
+class _StepClock:
+    def __init__(self):
+        self.t = 0.0
+
+    def now(self) -> float:
+        return self.t
+
+    def sleep(self, seconds: float) -> None:
+        self.t += float(seconds or 0)
+
+
+class _SecurityTab:
+    """只实现校验等待会碰到的那几个方法。refresh 不制造 token。"""
+
+    def __init__(self, *, recover_on_refresh: bool):
+        self.url = "https://www.zhipin.com/web/passport/zp/security.html?code=37&seed=abc&ts=1&name=e"
+        self.body = "正在加载中…"
+        self.cookies: list[dict] = []
+        self.refreshes = 0
+        self.gets: list[str] = []
+        self.recover_on_refresh = recover_on_refresh
+
+    def refresh(self):
+        self.refreshes += 1
+        if not self.recover_on_refresh:
+            return
+        self.url = "https://www.zhipin.com/web/geek/jobs?query=%E9%87%91%E8%9E%8D"
+        self.body = "岗位列表" * 20
+        self.cookies = [{
+            "name": "__zp_stoken__",
+            "value": "set-by-official-page",
+            "domain": ".zhipin.com",
+            "expires": 9_999_999_999,
+        }]
+
+    def get(self, url):
+        self.gets.append(url)
+
+    def run_js(self, script):
+        return self.body
+
+    def eles(self, selector, timeout=0.2):
+        if "job-card" in str(selector) and "/web/geek/job" in self.url:
+            return [object()]
+        return []
+
+    def run_cdp(self, command):
+        return {"cookies": list(self.cookies)}
+
+
+class TestSecurityTokenWait(unittest.TestCase):
+    def test_stuck_loading_reloads_the_official_page_then_succeeds(self):
+        clock = _StepClock()
+        reloads = {"n": 0}
+
+        def sample():
+            if reloads["n"] >= 1 and clock.t >= 12:
+                return "ok", "岗位列表" * 10, ("fresh-from-page", 10_000_000.0)
+            return "security", "正在加载中…", None
+
+        def reload():
+            reloads["n"] += 1
+
+        state = collect.resolve_security_wait(
+            sample, reload,
+            timeout=90, stuck_after=12, max_reloads=3, poll=1,
+            sleep=clock.sleep, now=clock.now,
+        )
+        self.assertEqual(state, "ok")
+        self.assertEqual(reloads["n"], 1)
+
+    def test_stuck_loading_times_out_after_the_reload_budget(self):
+        clock = _StepClock()
+        reloads = {"n": 0}
+
+        def reload():
+            reloads["n"] += 1
+
+        state = collect.resolve_security_wait(
+            lambda: ("security", "正在加载中...", None),
+            reload,
+            timeout=40, stuck_after=10, max_reloads=3, poll=1,
+            sleep=clock.sleep, now=clock.now,
+        )
+        self.assertEqual(state, "security")
+        self.assertEqual(reloads["n"], 3)
+
+    def test_fresh_cookie_counts_even_if_the_redirect_is_late(self):
+        clock = _StepClock()
+        reloads = {"n": 0}
+
+        def sample():
+            if clock.t >= 2:
+                return "security", "环境校验中", ("new-value", 99.0)
+            return "security", "环境校验中", ("old-value", 10.0)
+
+        state = collect.resolve_security_wait(
+            sample, lambda: reloads.__setitem__("n", reloads["n"] + 1),
+            timeout=30, stuck_after=12, max_reloads=3, poll=1,
+            before=("old-value", 10.0),
+            sleep=clock.sleep, now=clock.now,
+        )
+        self.assertEqual(state, "refreshed")
+        self.assertEqual(reloads["n"], 0)
+
+    def test_homepage_security_check_sees_a_new_cookie(self):
+        clock = _StepClock()
+        reloads = {"n": 0}
+
+        def sample():
+            if clock.t >= 3:
+                return "ok", "首页" * 30, ("new-value", 5_000.0)
+            return "blank", "正在加载中…", ("old-value", 10.0)
+
+        state = collect.wait_for_fresh_stoken(
+            sample, lambda: reloads.__setitem__("n", reloads["n"] + 1),
+            before=("old-value", 10.0),
+            timeout=30, stuck_after=12, max_reloads=2, poll=1,
+            sleep=clock.sleep, now=clock.now,
+        )
+        self.assertEqual(state, "ok")
+        self.assertEqual(reloads["n"], 0)
+
+    def test_homepage_security_check_times_out_when_the_cookie_never_changes(self):
+        clock = _StepClock()
+        reloads = {"n": 0}
+
+        def reload():
+            reloads["n"] += 1
+
+        state = collect.wait_for_fresh_stoken(
+            lambda: ("blank", "正在加载中…", ("old-value", 10.0)),
+            reload,
+            before=("old-value", 10.0),
+            timeout=30, stuck_after=10, max_reloads=2, poll=1,
+            sleep=clock.sleep, now=clock.now,
+        )
+        self.assertEqual(state, "timeout")
+        self.assertEqual(reloads["n"], 2)
+
+    def test_resolve_security_only_refreshes_the_open_page(self):
+        clock = _StepClock()
+        tab = _SecurityTab(recover_on_refresh=True)
+        state = collect._resolve_security(
+            tab, timeout=30, stuck_after=5, max_reloads=3, poll=1,
+            sleep=clock.sleep, now=clock.now,
+        )
+        self.assertEqual(state, "ok")
+        self.assertGreaterEqual(tab.refreshes, 1)
+        self.assertEqual(tab.gets, [])
+        self.assertTrue(tab.url.startswith("https://www.zhipin.com/web/geek/jobs"))
+
+    def test_resolve_security_timeout_does_not_invent_a_token(self):
+        clock = _StepClock()
+        tab = _SecurityTab(recover_on_refresh=False)
+        state = collect._resolve_security(
+            tab, timeout=40, stuck_after=10, max_reloads=3, poll=1,
+            sleep=clock.sleep, now=clock.now,
+        )
+        self.assertEqual(state, "security")
+        self.assertEqual(tab.refreshes, 3)
+        self.assertEqual(tab.gets, [])
+        self.assertEqual(tab.cookies, [])
+
+    def test_loading_shell_is_stuck_and_a_real_page_is_not(self):
+        self.assertTrue(collect.security_js_stuck("正在加载中…"))
+        self.assertTrue(collect.security_js_stuck("正在加载中..."))
+        self.assertTrue(collect.security_js_stuck("  "))
+        self.assertFalse(collect.security_js_stuck("岗位列表" * 20 + "正在加载"))
+        self.assertFalse(collect.token_is_fresh(("same", 10), ("same", 10)))
+        self.assertTrue(collect.token_is_fresh(("old", 10), ("new", 10)))
+        self.assertTrue(collect.token_is_fresh(None, ("new", 10)))
+
+    def test_preflight_stops_on_code_37_instead_of_walking_keywords(self):
+        def boom(page, keyword, page_no=1, timeout=15.0):
+            raise collect.BossBlocked(37, "您的环境存在异常.", keyword)
+
+        with mock.patch.object(collect, "search", side_effect=boom):
+            result = collect.preflight(object(), log=lambda msg: None)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["diag"]["circuit"])
+        self.assertEqual(result["diag"]["blocked"][0]["code"], 37)
+        self.assertIn("37", result["diag"]["errors"][0])
+
+
+class TestCatchupAndLastOk(unittest.TestCase):
+    def _failed(self, **extra):
+        row = {
+            "ts": "2026-11-23T12:36:00",
+            "mail": "SENT:user@example.com",
+            "collected": 0,
+            "ok": False,
+            "diag": {
+                "circuit": True,
+                "verify": False,
+                "login": None,
+                "blocked": [{"keyword": "金融解决方案", "code": 37, "msg": "您的环境存在异常."}],
+            },
+        }
+        row.update(extra)
+        return row
+
+    def test_alert_sent_does_not_advance_last_ok(self):
+        started = datetime(2026, 11, 23, 13, 30)
+        ts, row, healthy = watchdog.success_in_window(
+            [
+                {"ts": "2026-11-20T12:40:00", "mail": "SENT:old@example.com", "collected": 318},
+                self._failed(),
+            ],
+            started=started,
+        )
+        self.assertFalse(healthy)
+        self.assertEqual(ts.date().isoformat(), "2026-11-20")
+        self.assertEqual(row["collected"], 318)
+
+        alone_ts, alone_row, alone_ok = watchdog.success_in_window(
+            [self._failed(diag={"verify": True, "errors": ["安全验证：BOSS 环境校验页（__zp_stoken__ 刷新）未完成"]})],
+            started=started,
+        )
+        self.assertFalse(alone_ok)
+        self.assertIsNone(alone_ts)
+        self.assertIsNone(alone_row)
+
+    def test_skip_no_new_after_a_real_collect_is_still_healthy(self):
+        started = datetime(2026, 11, 24, 13, 30)
+        ts, row, healthy = watchdog.success_in_window(
+            [{
+                "ts": "2026-11-24T12:40:00",
+                "mail": "SKIP:no-new",
+                "collected": 321,
+                "fresh": 0,
+                "ok": True,
+            }],
+            started=started,
+        )
+        self.assertTrue(healthy)
+        self.assertEqual(row["mail"], "SKIP:no-new")
+        self.assertEqual(ts.hour, 12)
+        demo = {
+            "ts": "2026-11-24T12:50:00",
+            "mail": "SENT:user@example.com",
+            "collected": 5,
+            "diag": {"demo": True, "circuit": False, "verify": False, "login": None},
+        }
+        self.assertFalse(watchdog.row_is_success(demo, honor_flag=False))
+
+    def test_poll_does_not_treat_alert_sent_as_already_ok(self):
+        clock = _Clock(datetime(2026, 11, 23, 13, 30))
+        outcome = watchdog.poll_until_settled(
+            lambda: [self._failed(ts="2026-11-23T12:40:00")],
+            lambda: None,
+            lambda pid: False,
+            grace=1,
+            wait=5,
+            poll=1,
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+            now_fn=clock.now,
+        )
+        self.assertTrue(outcome["should_alert"])
+        self.assertEqual(outcome["reason"], "no-run-started")
+        self.assertIsNone(outcome["last_ok_ts"])
+
+    def test_catchup_runs_after_token_failure_not_after_skip(self):
+        now = datetime(2026, 11, 23, 19, 0)
+        run, reason = watchdog.catchup_decision([self._failed()], now=now)
+        self.assertTrue(run)
+        self.assertEqual(reason, "retry-token-failure")
+
+        skip = {
+            "ts": "2026-11-23T12:40:00",
+            "mail": "SKIP:no-new",
+            "collected": 321,
+            "fresh": 0,
+            "ok": True,
+        }
+        run, reason = watchdog.catchup_decision([skip], now=now)
+        self.assertFalse(run)
+        self.assertEqual(reason, "already-ok")
+
+        digest = {
+            "ts": "2026-11-23T12:40:00",
+            "mail": "SENT:user@example.com",
+            "collected": 297,
+            "fresh": 3,
+            "ok": True,
+        }
+        run, reason = watchdog.catchup_decision([digest], now=now)
+        self.assertFalse(run)
+        self.assertEqual(reason, "already-ok")
+
+    def test_catchup_covers_verify_page_but_not_a_login_wall(self):
+        now = datetime(2026, 11, 23, 19, 0)
+        verify = self._failed(diag={
+            "verify": True,
+            "circuit": False,
+            "login": None,
+            "errors": ["安全验证：BOSS 环境校验页（__zp_stoken__ 刷新）未完成"],
+        })
+        login = self._failed(diag={"login": "required", "verify": False, "circuit": False})
+        self.assertTrue(watchdog.catchup_decision([verify], now=now)[0])
+        run, reason = watchdog.catchup_decision([login], now=now)
+        self.assertFalse(run)
+        self.assertEqual(reason, "no-failed-collect")
+
+    def test_catchup_is_once_and_not_immediately_after_the_failure(self):
+        failed = self._failed()
+        retry = self._failed(ts="2026-11-23T19:08:00", catchup=True, ok=False)
+        run, reason = watchdog.catchup_decision(
+            [failed, retry], now=datetime(2026, 11, 23, 21, 0),
+        )
+        self.assertFalse(run)
+        self.assertEqual(reason, "already-retried")
+
+        fresh = self._failed(ts="2026-11-23T18:40:00")
+        run, reason = watchdog.catchup_decision(
+            [fresh], now=datetime(2026, 11, 23, 19, 0), min_backoff_s=3600,
+        )
+        self.assertFalse(run)
+        self.assertEqual(reason, "too-soon")
+
+    def test_collected_zero_with_code_37_still_qualifies_without_the_circuit_flag(self):
+        row = {
+            "ts": "2026-11-24T12:36:00",
+            "mail": "SENT:user@example.com",
+            "collected": 0,
+            "diag": {
+                "circuit": False,
+                "verify": False,
+                "login": None,
+                "blocked": [{"code": 37, "msg": "您的环境存在异常."}],
+            },
+        }
+        run, reason = watchdog.catchup_decision([row], now=datetime(2026, 11, 24, 19, 0))
+        self.assertTrue(run)
+        self.assertEqual(reason, "retry-token-failure")
+
+    def test_main_alerts_when_the_only_sent_is_an_alert(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp)
+            now = datetime.now().replace(microsecond=0)
+            (log_dir / "daily.log").write_text(
+                json.dumps({
+                    "ts": now.isoformat(timespec="seconds"),
+                    "mail": "SENT:user@example.com",
+                    "collected": 0,
+                    "ok": False,
+                    "diag": {"circuit": True, "blocked": [{"code": 37, "msg": "您的环境存在异常."}]},
+                }, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(watchdog, "LOG_DIR", log_dir), \
+                 mock.patch.object(sys, "argv", [
+                     "watchdog.py", "--force", "--dry-run",
+                     "--catchup-grace", "0", "--catchup-wait", "0",
+                 ]), \
+                 mock.patch("mailer.send_alert", return_value="DRY") as send:
+                code = watchdog.main()
+        self.assertEqual(code, 0)
+        send.assert_called_once()
+        self.assertIn("成功", send.call_args[0][0])
+
+
+class TestCatchupWiring(unittest.TestCase):
+    def _args(self, **overrides):
+        values = dict(
+            slot="19:00", dry_run=True, demo=False, keep_open=False,
+            force=True, profile="", catch_up=True,
+        )
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def test_skip_no_new_does_not_open_chrome(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"JOB_LOG_DIR": tmp}), \
+                 mock.patch("watchdog.catchup_decision", return_value=(False, "already-ok")), \
+                 mock.patch.object(run_daily.collect, "chrome_session") as session, \
+                 mock.patch.object(run_daily.mailer, "send_alert") as alert:
+                run_daily.run(self._args())
+            session.assert_not_called()
+            alert.assert_not_called()
+            text = (Path(tmp) / "daily.log").read_text(encoding="utf-8")
+        self.assertIn("SKIP:catchup-not-needed", text)
+        self.assertIn("already-ok", text)
+        self.assertNotIn('"catchup": true', text)
+
+    def test_failed_collect_schedules_one_real_retry(self):
+        diag = {
+            "boss": 0, "keywords": [], "blocked": [{"code": 37, "msg": "您的环境存在异常."}],
+            "errors": ["预检"], "login": None, "verify": False, "circuit": True,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"JOB_LOG_DIR": tmp, "JOB_OUT_DIR": tmp}), \
+                 mock.patch("watchdog.catchup_decision", return_value=(True, "retry-token-failure")), \
+                 mock.patch.object(run_daily.collect, "chrome_session", return_value=mock.Mock()), \
+                 mock.patch.object(run_daily.collect, "attach", return_value=object()), \
+                 mock.patch.object(run_daily.collect, "close_browser"), \
+                 mock.patch.object(run_daily.collect, "active_page", return_value=None), \
+                 mock.patch.object(run_daily, "gather", return_value=([], diag)), \
+                 mock.patch.object(run_daily.mailer, "send_alert", return_value="SENT:user@example.com"):
+                run_daily.run(self._args(dry_run=False))
+            rows = [
+                json.loads(line)
+                for line in (Path(tmp) / "daily.log").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        finished = [row for row in rows if row.get("mail")]
+        self.assertEqual(len(finished), 1)
+        self.assertTrue(finished[0]["catchup"])
+        self.assertFalse(finished[0]["ok"])
+        self.assertEqual(finished[0]["collected"], 0)
+        finished_ts = datetime.fromisoformat(finished[0]["ts"])
+        later = finished_ts + timedelta(minutes=30)
+        if later.date() != finished_ts.date():
+            later = finished_ts
+        again, reason = watchdog.catchup_decision(rows, now=later)
+        self.assertFalse(again)
+        self.assertEqual(reason, "already-retried")
+
+    def test_gather_does_not_walk_keywords_after_a_blocked_preflight(self):
+        blocked = collect._preflight_result(
+            ok=False, circuit=True,
+            blocked=[{"keyword": "金融解决方案", "code": 37, "msg": "您的环境存在异常."}],
+            errors=["预检：风控 code=37"],
+        )
+        with mock.patch.object(run_daily.collect, "preflight", return_value=blocked), \
+             mock.patch.object(run_daily.collect, "collect_keywords") as keywords:
+            jobs, diag = run_daily.gather(object(), "12:30")
+        keywords.assert_not_called()
+        self.assertEqual(jobs, [])
+        self.assertTrue(diag["circuit"])
+        self.assertFalse(diag["preflight_ok"])
+
+    def test_install_task_registers_a_catchup_hook_outside_run_times(self):
+        script = (Path(__file__).resolve().parent / "install_task.ps1").read_text(encoding="utf-8")
+        self.assertIn("$TaskPrefix-Catchup", script)
+        self.assertIn("$TaskPrefix-Legal-Catchup", script)
+        self.assertIn("--catch-up", script)
+        cfg = json.loads((Path(__file__).resolve().parent / "config.json").read_text(encoding="utf-8"))
+        legal = json.loads(
+            (Path(__file__).resolve().parent / "profiles" / "legal" / "config.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(cfg["search"]["run_times"], ["12:30"])
+        self.assertEqual(cfg["search"]["catchup_time"], "19:00")
+        self.assertEqual(legal["search"]["run_times"], ["12:45"])
+        self.assertEqual(legal["search"]["catchup_time"], "19:15")
+        self.assertIn("法务总监", legal["keywords"]["core"])
+        self.assertNotIn("catchup_time", legal["keywords"])
 
 
 class TestDefaultProfilePolicy(unittest.TestCase):

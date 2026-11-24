@@ -42,11 +42,13 @@
 - **只采 BOSS 直聘**：搜索、登录态、风控处理全部围绕 BOSS 一条链路，不再混入其他招聘站。
 - **像真人一样取数**：打开真实搜索页，先让页面正常渲染；再在页面上下文里 `fetch` 同源 `joblist.json`（带 cookie / referer），拿明文薪资与完整字段。接口被挡时读已渲染的 DOM（薪资图标字体自动解码），再不行才收页面自己的响应。**不会**再把接口当页面直接打开。
 - **登录态先探测、失效即停**：搜索页被重定向到 `/web/user/` 就立即停止，不再拿多个关键词硬试，也不在掉登录后继续打接口。
-- **认出「37 不是封禁」**：BOSS 会定期刷新 `__zp_stoken__`，搜索页会先跳到 `/web/passport/zp/security.html?code=37`，或先回到首页做 `_security_check`，由页面脚本算出新 token 再继续。脚本会等它完成（必要时刷新一次），然后重新打开搜索页；只有校验页始终不完成才停止。旧代码把这一步当成封禁，所以每次 token 过期都空手而归。
-- **风控分级处理**：`code=35/36` 才是 IP / 账号级风控，`code=37` 多数是上面的 token 刷新。单个关键词退避 12–22 秒重试一次；连续 3 个关键词都被挡才熔断，避免一个瞬时错误把整轮结果清零。
+- **认出「37 不是封禁」**：BOSS 会定期刷新 `__zp_stoken__`，搜索页会先跳到 `/web/passport/zp/security.html?code=37`，或先回到首页做 `_security_check`，由页面自己的脚本写好新 cookie 再继续。脚本会等 cookie 出现；页停在「正在加载中…」（校验 JS 没启动）时，重新加载**当前这个官方页面**，不计算 token、不改 cookie。只有校验页到点仍不完成才停止。
+- **采集前先体检**：正式关键词之前，用和 `python login.py --check` 相同的方式打开搜索页并探测一次。token 仍是 code=37，或校验页没完成，就停住，不把当天每个关键词再打一遍。
+- **风控分级处理**：`code=35/36` 才是 IP / 账号级风控，`code=37` 多数是上面的 token 刷新。单个关键词退避 12–22 秒重试一次；连续 3 个关键词都被挡才熔断。code=37 的首页回跳每轮只做一次，失败后等晚间补跑，不紧挨着连打。
 - **登录态更耐久**：每轮结束正常关闭 Chrome（`Browser.close`），让 cookie 落盘；不再强制 `Stop-Process` 杀进程。
 - **共用 Chrome 有跨进程锁**：默认画像和法务画像共用调试端口 9333。开机补跑把两份任务挤在同一秒时，后启动的一方会等待（写入 `logs/chrome_lock.log`），前任关完浏览器后再自己拉起 Chrome。采集中途端口掉了，会在仍持有锁的情况下重启并继续剩下的关键词。
-- **看门狗不误报补跑**：和本画像日报同一秒启动时，先等这轮结束；随后落下 `SENT` 或 `SKIP` 就不再告警。
+- **看门狗只认采集成功**：和本画像日报同一秒启动时，先等这轮结束。成功是「采到岗位后的日报」或「采集成功后的 `SKIP:no-new`」。`send_alert` 也会显示 `SENT`，但 `collected=0`、熔断或校验页失败不算成功，`last_ok` 不往前走；告警信照发。
+- **晚间补跑一次**：午间因环境 token / 熔断 / 校验页失败时，当天晚上再试一次（默认 19:00，法务画像 19:15）。已经成功或 `SKIP:no-new` 不会再跑。和午间失败至少隔一小时，避免 code=37 之后立刻连打。
 - **硬性排除**：销售岗、保险公司主体（科技子公司放行）、第三方财富/投资咨询、传统金融机构主体、薪资不达标。
 - **六维打分**：岗位族 26 + 业务域 30 + AI/科技 14 + 层级 12 + 薪资 10 + 公司规模 8，阈值 50 分才推送。
 - **评分直接进邮件**：每条岗位显示匹配度分数、分数档位配色、六维构成；邮件标题带最高分。
@@ -63,7 +65,7 @@ flowchart LR
     A[工作日 12:30] --> B[拉起独立 Chrome<br/>端口 9333]
     B --> C[打开 BOSS 搜索页<br/>关键词 × N]
     C --> D{页面状态}
-    D -->|security.html 校验页| S[等待 __zp_stoken__ 刷新<br/>卡住则刷新一次]
+    D -->|security.html 校验页| S[等待官方页写好 cookie<br/>正在加载中则重载当前页]
     S --> C
     D -->|被重定向 /web/user| E[登录失效<br/>立即停止 + 告警]
     D -->|已登录| F[页面内 fetch joblist<br/>同源 XHR + cookie]
@@ -144,9 +146,10 @@ powershell -ExecutionPolicy Bypass -File .\install_task.ps1
 
 - 先看 `-Python` 参数，再找 PATH 里的 `pythonw.exe` / `python.exe`，最后扫描 `%LOCALAPPDATA%\Programs\Python`；
 - 逐个执行 `import DrissionPage` 探测，只注册到通过探测的解释器；
-- 同时注册 `JobMatch-Watchdog`（工作日 13:30）：当天没有任何一条成功记录（`SENT` 或 `SKIP`）时发告警邮件。
+- 同时注册 `JobMatch-Watchdog`（工作日 13:30）：当天没有成功采集（有结果的日报，或 `SKIP:no-new`）时发告警。告警邮件本身的 `SENT` 不算成功。
+- 同时注册 `JobMatch-Catchup`（工作日 19:00）：只有午间因 BOSS 环境 token、熔断或校验页失败时才再采一次；成功和 `SKIP:no-new` 会直接退出。
 
-如果 `profiles/legal/config.json` 存在，还会顺带注册 `JobMatch-Legal-1245`（12:45）和 `JobMatch-Legal-Watchdog`（13:45）。两个画像共用 9333 端口的 Chrome：日程仍然错开，另外用一把跨进程锁，避免开机补跑时互相关掉浏览器。
+如果 `profiles/legal/config.json` 存在，还会顺带注册 `JobMatch-Legal-1245`（12:45）、`JobMatch-Legal-Watchdog`（13:45）和 `JobMatch-Legal-Catchup`（19:15）。两个画像共用 9333 端口的 Chrome：日程仍然错开，另外用一把跨进程锁，避免开机补跑时互相关掉浏览器。晚间补跑同样错开 15 分钟。
 
 删除：`Unregister-ScheduledTask -TaskName "JobMatch-1230" -Confirm:$false`（`JobMatch-Legal-1245`、`JobMatch-Watchdog` 同理）。
 
@@ -157,7 +160,7 @@ powershell -ExecutionPolicy Bypass -File .\install_task.ps1
 > 已关机（非睡眠）时无法唤醒，由 `StartWhenAvailable` 在下次开机后补跑，且与去重库共用，不会重复推送。
 > 补跑会把当天错过的日报和看门狗在同一时刻拉起。两份画像通过跨进程锁排队使用 9333：先拿到锁的跑完并 `Browser.close`，后拿到锁的再启动自己的 Chrome。看门狗若发现本画像的 `run_in_progress.json` 还在（或宽限期内出现），会等到这轮写出 `SENT` / `SKIP` 再决定要不要告警。
 >
-> 任务最长运行时间是 60 分钟，用来盖住「先等另一份画像，再跑自己」。已经装过计划任务的机器需要重新执行一次 `install_task.ps1`，只更新代码不会改 Task Scheduler 里的旧时限。
+> 任务最长运行时间是 60 分钟，用来盖住「先等另一份画像，再跑自己」。已经装过计划任务的机器需要重新执行一次 `install_task.ps1`，只更新代码不会改 Task Scheduler 里的旧时限，也不会出现新的 `JobMatch-Catchup` / `JobMatch-Legal-Catchup`。
 >
 > **路径注意**：项目目录含中文时，PowerShell 5.1 会把无 BOM 脚本按 GBK 解码，可能让注册进计划任务的路径变成乱码（`0x8007000B`）。`install_task.ps1` 已写成纯 ASCII，并用 `$PSScriptRoot` 取项目目录。若仍遇到编码问题，可建一个 ASCII junction 再装：
 >
@@ -219,6 +222,7 @@ python watchdog.py --profile legal                     # 法务画像的看门�
 | `search.weekdays_only` | 只在周一至周五推送（默认 `true`）；周末即使被补跑也会跳过 |
 | `search.skip_when_no_new` | 当天没有新岗位时不发信，只记 `SKIP:no-new`（默认 `true`）；设 `false` 则每天必发一封 |
 | `search.watchdog_time` | 看门狗运行时刻（默认 `13:30`，同样是工作日） |
+| `search.catchup_time` | 晚间补跑时刻（默认画像 `19:00`，法务画像 `19:15`）。任务每天注册，但只有当天采集因环境 token / 熔断 / 校验页失败才真正再跑 |
 | `search.max_pages` | 每个关键词翻几页（默认 1，翻页越多越容易触发风控） |
 | `search.keyword_delay_seconds` | 关键词之间的随机停顿区间（秒） |
 | `search.block_retries` | 单个关键词被风控后重试几次（默认 1） |
@@ -307,7 +311,7 @@ python watchdog.py --profile legal                     # 法务画像的看门�
 ├── store.py             # SQLite 去重库
 ├── mailer.py            # SMTP 发信 + HTML 日报模板
 ├── run_daily.py         # 编排入口（--slot / --dry-run / --demo / --keep-open）
-├── watchdog.py          # 看门狗：当天没有成功推送就告警；补跑时先等日报
+├── watchdog.py          # 看门狗：只把真正采集成功当作 last_ok；并判断要不要晚间补跑
 ├── test_robustness.py   # Chrome 锁、断线重连、看门狗补跑（不启动浏览器）
 ├── preview_email.py     # 生成邮件预览页并截图
 ├── read_resume.py       # 把 .docx 简历抽成纯文本，便于摘录关键词
@@ -337,7 +341,7 @@ python watchdog.py --profile legal                     # 法务画像的看门�
 
 **开机后两份日报和看门狗挤在同一秒？**
 
-这是 `StartWhenAvailable` 补跑。两份画像会排队用 9333，而不是同时操作同一个 Chrome。看 `logs/chrome_lock.log`：应有 `wait`，然后 `acquire`，跑完是 `release`。后启动的那份会在前任关闭浏览器之后自己再拉起 Chrome。看门狗在本画像日报还在跑时不会发「昨天没有成功」的告警；日报写出 `SENT` 或 `SKIP` 后它直接结束。
+这是 `StartWhenAvailable` 补跑。两份画像会排队用 9333，而不是同时操作同一个 Chrome。看 `logs/chrome_lock.log`：应有 `wait`，然后 `acquire`，跑完是 `release`。后启动的那份会在前任关闭浏览器之后自己再拉起 Chrome。看门狗在本画像日报还在跑时不会发「昨天没有成功」的告警；日报写出成功采集（有结果的 `SENT`，或 `SKIP:no-new`）后它直接结束。只有告警邮件的 `SENT` 仍会告警。
 
 **任务准点触发，但没有日志也没有邮件？**
 
@@ -350,12 +354,18 @@ python watchdog.py --profile legal                     # 法务画像的看门�
 **登录态失效 / 卡在安全验证？**
 
 - 被重定向到登录页：`python login.py` 重新扫码；
-- `security.html?code=37`：等页面脚本刷新 `__zp_stoken__`，通常 30 秒内自动恢复，不需要扫码；
-- `code=35/36`：IP / 账号级风控，等 30–60 分钟或换网络出口，不要连续重试。
+- `security.html?code=37`：等官方页面自己写好 `__zp_stoken__`。停在「正在加载中…」时脚本会重新加载当前校验页，不需要扫码，也不要自己填 token；
+- `code=35/36`：IP / 账号级风控，等晚间补跑或换网络出口，不要连续重试。
 
 **`code=37` 到底是不是封禁？**
 
-大多数时候不是。BOSS 会定期刷新 `__zp_stoken__`：搜索页可能先跳到 `/web/passport/zp/security.html?code=37&seed=...&ts=...&name=...`，也可能先被送回首页做 `?_security_check=...`，页内 security JS 用 seed/ts 算出新 token 再继续。脚本会等校验页跑完再取结果，只有始终不完成才停止。
+大多数时候不是。BOSS 会定期刷新 `__zp_stoken__`：搜索页可能先跳到 `/web/passport/zp/security.html?code=37&seed=...&ts=...&name=...`，也可能先被送回首页做 `?_security_check=...`，页内 security JS 用页面下发的 seed/ts 写出新 cookie。无人值守的 Chrome 里，这个 JS 有时停在「正在加载中…」根本没启动，搜索接口就一直返回「您的环境存在异常」。脚本会多等一会儿，并在卡住时刷新**当前官方 URL**；采集前还会先做一次探测。自己算 token 或改 cookie 不在这个项目里。
+
+午间仍然失败时，看门狗会告警（这封 `SENT` 不算当天成功）。`JobMatch-Catchup`（默认 19:00）和 `JobMatch-Legal-Catchup`（19:15）当天再试一次。已经采集成功或 `SKIP:no-new` 的那天，补跑任务启动后马上退出。补跑和失败之间至少隔一小时。装过旧计划任务的机器要重新跑一遍 `install_task.ps1` 才会有这两个任务。
+
+**午间邮件说采集失败，但晚上不想等到补跑？**
+
+在项目目录运行 `python login.py`（不要只跑 `--check`）。窗口抬到眼前后，让官方校验页自己跳回，看到「搜索校验：N 条」再关。这和晚间补跑走的是同一条官方页面，只是有人看着窗口。
 
 **为什么不用接口直连？**
 

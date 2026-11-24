@@ -19,6 +19,7 @@
     "weekdays_only": true,
     "skip_when_no_new": true,
     "watchdog_time": "13:45",
+    "catchup_time": "19:15",
     "city_allow": [
       "北京",
       "上海",
