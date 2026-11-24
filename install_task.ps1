@@ -102,11 +102,13 @@ Write-Output "using interpreter: $chosen"
 # run_times comes from config.json so the schedule and the code stay in sync
 $cfgPath = Join-Path $Root "config.json"
 $times = @("11:30", "18:00")
+$catchupAt = "19:00"
 if (Test-Path $cfgPath) {
     try {
         $cfg = [System.IO.File]::ReadAllText($cfgPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
         if ($cfg.search.run_times) { $times = @($cfg.search.run_times) }
         if (-not $WatchdogAt -and $cfg.search.watchdog_time) { $WatchdogAt = [string]$cfg.search.watchdog_time }
+        if ($cfg.search.catchup_time) { $catchupAt = [string]$cfg.search.catchup_time }
     } catch {
         Write-Warning "config.json parse failed, using default times"
     }
@@ -146,8 +148,24 @@ if (Test-Path $dog) {
     $action  = New-ScheduledTaskAction -Execute $chosen -Argument "`"$dog`"" -WorkingDirectory $Root
     $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $weekdays -At $WatchdogAt
     Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Settings $settings `
-        -Description "Alerts when today's job push produced no successful send (Mon-Fri)" -Force | Out-Null
+        -Description "Alerts when today's job push had no successful collection (Mon-Fri)" -Force | Out-Null
     Write-Output "registered ${name}: Mon-Fri at $WatchdogAt"
+    $wanted += $name
+}
+
+# Evening catch-up. StartWhenAvailable only replays a task that never started.
+# A noon run that started, hit code=37 / the security page, and sent an alert
+# would otherwise sit until the next day. This task is registered every
+# weekday and the Python gate no-ops unless that failure is already in today's
+# log and at least an hour old. SKIP:no-new does not qualify. Re-run this
+# script on an existing install; editing the Python files does not create it.
+if ($catchupAt) {
+    $name    = "$TaskPrefix-Catchup"
+    $action  = New-ScheduledTaskAction -Execute $chosen -Argument "`"$script`" --slot $catchupAt --catch-up" -WorkingDirectory $Root
+    $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $weekdays -At $catchupAt
+    Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Settings $settings `
+        -Description "Weekday evening retry after a failed BOSS token/collect (no-op if today already succeeded)" -Force | Out-Null
+    Write-Output "registered ${name}: Mon-Fri at $catchupAt (catch-up)"
     $wanted += $name
 }
 
@@ -159,10 +177,12 @@ $legalCfgPath = Join-Path $Root "profiles\legal\config.json"
 if (Test-Path $legalCfgPath) {
     $legalTimes = @("12:45")
     $legalDogAt = "13:45"
+    $legalCatchupAt = "19:15"
     try {
         $legalCfg = [System.IO.File]::ReadAllText($legalCfgPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
         if ($legalCfg.search.run_times) { $legalTimes = @($legalCfg.search.run_times) }
         if ($legalCfg.search.watchdog_time) { $legalDogAt = [string]$legalCfg.search.watchdog_time }
+        if ($legalCfg.search.catchup_time) { $legalCatchupAt = [string]$legalCfg.search.catchup_time }
     } catch {
         Write-Warning "profiles/legal/config.json parse failed, using default times"
     }
@@ -179,9 +199,19 @@ if (Test-Path $legalCfgPath) {
     $action  = New-ScheduledTaskAction -Execute $chosen -Argument "`"$dog`" --profile legal" -WorkingDirectory $Root
     $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $weekdays -At $legalDogAt
     Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Settings $settings `
-        -Description "Alerts when today's legal profile push produced no successful send (Mon-Fri)" -Force | Out-Null
+        -Description "Alerts when today's legal profile push had no successful collection (Mon-Fri)" -Force | Out-Null
     Write-Output "registered ${name}: Mon-Fri at $legalDogAt (profile=legal)"
     $wanted += $name
+
+    if ($legalCatchupAt) {
+        $name    = "$TaskPrefix-Legal-Catchup"
+        $action  = New-ScheduledTaskAction -Execute $chosen -Argument "`"$script`" --slot $legalCatchupAt --catch-up --profile legal" -WorkingDirectory $Root
+        $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $weekdays -At $legalCatchupAt
+        Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Settings $settings `
+            -Description "Weekday evening retry for the legal profile after a failed BOSS token/collect" -Force | Out-Null
+        Write-Output "registered ${name}: Mon-Fri at $legalCatchupAt (profile=legal, catch-up)"
+        $wanted += $name
+    }
 }
 
 # Remove stale tasks not present in run_times (e.g. old 1130 / 1800 after a time change)

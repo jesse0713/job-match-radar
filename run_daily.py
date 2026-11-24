@@ -8,6 +8,7 @@
     python run_daily.py --slot 12:30 --dry-run  # 不发信，写 .eml 预览
     python run_daily.py --demo --dry-run        # 用假数据验证链路
     python run_daily.py --slot 12:30 --keep-open  # 跑完不关自动化浏览器（排障用）
+    python run_daily.py --slot 19:00 --catch-up   # 仅在今天环境 token 失败后补跑一次
 """
 from __future__ import annotations
 
@@ -94,7 +95,17 @@ def normalize(raw: dict) -> dict:
 
 
 def gather(page, slot: str = "12:30") -> tuple[list[dict], dict]:
-    """只从 BOSS 采集；登录失效 / 风控的判定与退避都在 collect 里。"""
+    """只从 BOSS 采集；登录失效 / 风控的判定与退避都在 collect 里。
+
+    先做一次预检（官方校验页 + 一次探测搜索）。token 仍是 code=37 或校验页
+    没完成就停，不把当天关键词再打一遍。
+    """
+    pre = collect.preflight(page)
+    if not pre.get("ok"):
+        diag = dict(pre.get("diag") or {})
+        diag["boss"] = 0
+        diag["preflight_ok"] = False
+        return [], diag
     search_cfg = CFG.get("search", {})
     jobs, diag = collect.collect_keywords(
         page,
@@ -102,7 +113,10 @@ def gather(page, slot: str = "12:30") -> tuple[list[dict], dict]:
         max_pages=int(search_cfg.get("max_pages", 1)),
         delay=tuple(search_cfg.get("keyword_delay_seconds", [3.5, 7.0])),
         block_retries=int(search_cfg.get("block_retries", 1)),
+        reset_token_bounce=False,
     )
+    diag["preflight_ok"] = True
+    diag["preflight_count"] = pre.get("count", 0)
 
     jobs = [j for j in jobs if j.get("title") and (j.get("company") or j.get("salary_text"))]
     # 同一次运行内先去重（不同关键词可能命中同一岗位）
@@ -167,10 +181,12 @@ DEMO_JOBS_LEGAL = [
 ]
 
 
-def log(payload: dict) -> None:
-    from pathlib import Path
+def _log_dir() -> Path:
+    return Path(os.environ.get("JOB_LOG_DIR", BASE / "logs"))
 
-    d = Path(os.environ.get("JOB_LOG_DIR", Path(__file__).resolve().parent / "logs"))
+
+def log(payload: dict) -> None:
+    d = _log_dir()
     d.mkdir(parents=True, exist_ok=True)
     with (d / "daily.log").open("a", encoding="utf-8") as f:
         f.write(json.dumps({"ts": datetime.now().isoformat(timespec="seconds"),
@@ -178,9 +194,24 @@ def log(payload: dict) -> None:
                            ensure_ascii=False) + "\n")
 
 
-def _alert_message(diag: dict) -> str:
+def _token_followup(diag: dict, catch_up: bool) -> str:
+    """午间 token 失败时告诉收件人：晚间会再试一次，这次告警不是最后结果。"""
+    if catch_up:
+        return " 这已经是当天的晚间补跑，不会再自动重试。仍不行就运行 python login.py。"
+    blocked = diag.get("blocked") or []
+    codes = {str(b.get("code")) for b in blocked if isinstance(b, dict)}
+    if diag.get("verify") or diag.get("circuit") or "37" in codes:
+        return (
+            " 若这是午间任务，晚间补跑会在至少一小时后再试一次，"
+            "不会立刻连打。这封是告警，不算当天采集成功。"
+        )
+    return ""
+
+
+def _alert_message(diag: dict, *, catch_up: bool = False) -> str:
     last = collect.last_login_ok()
     suffix = f"（上次搜索成功：{last}）" if last else ""
+    follow = _token_followup(diag, catch_up)
 
     if diag.get("login"):
         return (
@@ -190,15 +221,17 @@ def _alert_message(diag: dict) -> str:
     if diag.get("verify"):
         return (
             "BOSS 环境校验页（security.html，用于刷新 __zp_stoken__）没有自动完成，"
-            "本轮已停止。先在电脑上手动打开 BOSS 搜索页等它自动跳回；仍不行再运行 "
-            "python login.py 打开窗口看一眼。这不是账号密码或扫码问题。"
+            "本轮已停止。脚本只刷新了官方校验页并等待 cookie，没有自己计算 token。"
+            "仍不行再运行 python login.py 打开窗口看一眼。这不是账号密码或扫码问题。"
+            + follow
         )
     if diag.get("circuit") or diag.get("blocked"):
         codes = sorted({str(b.get("code")) for b in diag.get("blocked") or []})
         code_s = "/".join(codes) or "35/37"
         return (
-            f"BOSS 搜索接口触发风控（code={code_s}，环境/IP 异常），本轮已按设计熔断，"
-            "没有继续硬打。这不是登录失效，不用扫码；等 30–60 分钟或切换网络出口后重试即可。"
+            f"BOSS 搜索接口触发风控（code={code_s}，环境/IP 异常），本轮已按设计停住，"
+            "没有继续硬打。这不是登录失效，不用扫码。"
+            + follow
         )
     return (
         "本次没有采集到岗位：可能是当天关键词无结果，或 BOSS 页面结构变化。"
@@ -266,10 +299,40 @@ def run(args) -> None:
             and search_cfg.get("weekdays_only", True)
             and datetime.now().weekday() >= 5):
         log({"slot": args.slot, "collected": 0, "scored_pass": 0, "fresh": 0,
-             "mail": "SKIP:weekend", "diag": {"reason": "周末不推送"}})
+             "mail": "SKIP:weekend", "diag": {"reason": "周末不推送"}, "ok": False})
         return
 
-    log({"event": "start", "slot": args.slot})
+    catch_up = bool(getattr(args, "catch_up", False))
+    if catch_up and not args.demo:
+        # 晚间任务每天都会被拉起。只有午间确实因环境 token 失败，才再采一次。
+        # 成功、SKIP:no-new、掉登录、刚失败不到一小时、今天已经补跑过：直接退出。
+        import watchdog
+
+        entries = watchdog._read_entries(_log_dir() / "daily.log")
+        marker = None
+        try:
+            import run_state
+
+            marker = run_state.read_run_marker()
+        except Exception:
+            marker = None
+        should, reason = watchdog.catchup_decision(
+            entries, now=datetime.now(), marker=marker, own_pid=os.getpid(),
+        )
+        if not should:
+            log({
+                "slot": args.slot, "collected": 0, "scored_pass": 0, "fresh": 0,
+                "mail": "SKIP:catchup-not-needed", "reason": reason, "ok": False,
+                "diag": {"reason": reason},
+            })
+            try:
+                print(f"SKIP catch-up: {reason}")
+            except Exception:
+                pass
+            return
+        log({"event": "catchup", "slot": args.slot, "reason": reason})
+
+    log({"event": "start", "slot": args.slot, "catchup": catch_up})
     _phase("starting", slot=args.slot)
 
     try:
@@ -333,8 +396,10 @@ def run(args) -> None:
         # 采集正常、但当天没有新岗位时默认不发信（只记 SKIP），避免空邮件刷屏。
         skip_empty = bool(search_cfg.get("skip_when_no_new", True))
         if not raw_jobs and not args.demo:
-            result = mailer.send_alert(_alert_message(diag), CFG, run_label,
-                                       dry_run=args.dry_run)
+            result = mailer.send_alert(
+                _alert_message(diag, catch_up=catch_up), CFG, run_label,
+                dry_run=args.dry_run,
+            )
         elif skip_empty and not fresh:
             result = "SKIP:no-new"
         else:
@@ -344,11 +409,17 @@ def run(args) -> None:
         if not args.dry_run and result.startswith("SENT") and fresh:
             store.remember(fresh, run_tag=f"{datetime.now():%Y-%m-%d} {args.slot}")
 
+        import watchdog
+
         payload = {
             "slot": args.slot, "collected": len(raw_jobs), "scored_pass": len(scored),
             "fresh": len(fresh), "mail": result, "diag": diag,
             "top": [{"t": j["title"], "c": j["company"], "s": j["score"]} for j in fresh[:10]],
         }
+        # 补跑标记只写在真正发出去的那一轮上。dry-run 不占用当天唯一的补跑机会。
+        if catch_up and not args.dry_run:
+            payload["catchup"] = True
+        payload["ok"] = watchdog.row_is_success(payload, honor_flag=False)
         log(payload)
         try:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -406,6 +477,8 @@ def main() -> None:
                     help="跑完不关闭自动化浏览器（排障用）")
     ap.add_argument("--force", action="store_true",
                     help="周末也强制跑一次（默认周末直接跳过）")
+    ap.add_argument("--catch-up", action="store_true",
+                    help="晚间补跑：仅当今天的采集因 BOSS 环境 token / 熔断 / 校验页失败时才再采一次")
     ap.add_argument("--profile", default=PROFILE,
                     help="求职画像名（profiles/<name>/config.json），不传则用基础 config.json")
     args = ap.parse_args()
